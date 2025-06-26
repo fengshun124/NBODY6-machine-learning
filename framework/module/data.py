@@ -1,4 +1,3 @@
-import warnings
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -12,25 +11,6 @@ from sklearn.preprocessing import (
     StandardScaler,
 )
 from torch.utils.data import DataLoader, Dataset
-
-
-def _fetch_scalar(
-    scalar_type: str,
-) -> Union[None, StandardScaler, MinMaxScaler, RobustScaler]:
-    match scalar_type:
-        case "StandardScaler":
-            return StandardScaler()
-        case "MinMaxScaler":
-            return MinMaxScaler()
-        case "RobustScaler":
-            return RobustScaler()
-        case "None":
-            return None
-        case _:
-            warnings.warn(
-                f"[WARN] Unregistered scaler type '{scalar_type}'. Defaulting to None."
-            )
-            return None
 
 
 class NBodyDataset(Dataset):
@@ -119,8 +99,7 @@ class NBodyDataModule(pl.LightningDataModule):
         train_pairs = [self._raw_snapshot_pairs[i] for i in train_indices]
         val_pairs = [self._raw_snapshot_pairs[i] for i in val_indices]
 
-        for feature_indices, scalar_label in self._snapshot_scalar_dict.items():
-            scalar = _fetch_scalar(scalar_label)
+        for feature_indices, scalar in self._snapshot_scalar_dict.items():
             if scalar is None:
                 continue
             scalar.fit(
@@ -147,8 +126,7 @@ class NBodyDataModule(pl.LightningDataModule):
                     ).flatten()
                 val_pairs[idx] = (attr_tuple, df_copy)
 
-        for attr_idx, scalar_label in self._attr_tuple_scalar_dict.items():
-            scalar = _fetch_scalar(scalar_label)
+        for attr_idx, scalar in self._attr_tuple_scalar_dict.items():
             if scalar is None:
                 continue
             scalar.fit(

@@ -35,7 +35,7 @@ class NBodySnapshotSamplerBase(ABC):
             Dict[str, Dict[Tuple[Union[int, float, str], ...], List[pd.DataFrame]]]
         ] = None
         self._sampled_snapshots_pairs: Optional[
-            List[Tuple[Union[int, float, str], ...], pd.DataFrame]
+            List[Tuple[Tuple[Union[int, float, str], ...], pd.DataFrame]]
         ] = None
         self._sample_strategy_dict: Optional[Dict] = None
 
@@ -51,7 +51,7 @@ class NBodySnapshotSamplerBase(ABC):
         simulation_label: str,
         simulation_dict: Dict[Tuple[Union[int, float, str], ...], pd.DataFrame],
         n_jobs: int = -1,
-    ) -> Tuple[Tuple[Union[int, float, str], ...], List[pd.DataFrame]]:
+    ) -> Dict[Tuple[Union[int, float, str], ...], List[pd.DataFrame]]:
         sampled_snapshot_pairs = ParallelTqdm(
             n_jobs=n_jobs,
             desc=f'Sampling "{simulation_label}"',
@@ -130,7 +130,7 @@ class NBodySnapshotSamplerBase(ABC):
     @property
     def sampled_snapshot_pairs(
         self,
-    ) -> Optional[List[Tuple[Tuple[Union[int, float, str], ...], pd.DataFrame]]]:
+    ) -> List[Tuple[Tuple[Union[int, float, str], ...], List[pd.DataFrame]]]:
         if self._sampled_snapshots_pairs is not None:
             return self._sampled_snapshots_pairs
 
@@ -202,7 +202,7 @@ class NBodySnapshotNonEmptySampler(NBodySnapshotSamplerBase):
         n_star_per_sample = sample_strategy_dict.get("n_star_per_sample", 256)
         n_sample_per_snapshot = sample_strategy_dict.get("n_sample_per_snapshot", 24)
         random_seed = sample_strategy_dict.get("random_seed", RANDOM_SEED)
-        
+
         # age filter
         if attr_tuple[-1] > 1900 or attr_tuple[-1] == 0:
             return None

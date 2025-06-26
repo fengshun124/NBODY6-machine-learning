@@ -17,7 +17,7 @@ SNAPSHOT_FIELD_KEY_DICT = {
     "004 V1": "u",
     "005 V2": "v",
     "006 V3": "w",
-    # '023 M': 'mass',
+    "023 M": "mass",
     "032 Name": "uid",
 }
 SNAPSHOT_FILENAME_PATTERN = re.compile(r"^snap\.40_(\d+)\.h5part$")
@@ -63,7 +63,7 @@ class NBodyH5SnapshotCollector:
 
     @property
     def nbody_simulation_root(self) -> str:
-        return self._nbody_sim_root
+        return str(self._nbody_sim_root)
 
     @property
     def attr_labels(self) -> Tuple[str, ...]:
@@ -127,7 +127,9 @@ class NBodyH5SnapshotCollector:
             self._uid_aligned_collection_dict[sim_name] = {}
             for attr_tuple, snapshot_df in sim_dict.items():
                 self._uid_aligned_collection_dict[sim_name][attr_tuple] = (
-                    snapshot_df.reindex(unique_uids, fill_value=np.nan).sort_index()
+                    snapshot_df.reindex(
+                        list(unique_uids), fill_value=np.nan
+                    ).sort_index()
                 )
 
         return self._uid_aligned_collection_dict
@@ -161,7 +163,7 @@ class NBodyH5SnapshotCollector:
                 snapshot_df = (
                     pd.DataFrame(
                         {
-                            df_key: h5f["Step#0"][field_key][()]
+                            df_key: h5f["Step#0"][field_key][:]
                             for field_key, df_key in SNAPSHOT_FIELD_KEY_DICT.items()
                         }
                     )
@@ -197,11 +199,12 @@ class NBodyH5SnapshotCollector:
                 entry.path,
                 {
                     **sim_base_attr_dict,
-                    "age": int(SNAPSHOT_FILENAME_PATTERN.match(entry.name).group(1)),
+                    "age": int(match.group(1)),
                 },
             )
             for entry in os.scandir(simulation_dir)
             if entry.is_file()
+            and (match := SNAPSHOT_FILENAME_PATTERN.match(entry.name)) is not None
         ]
         if not snapshot_tuples:
             logger.warning(f"No valid snapshot files found in {simulation_dir}.")
@@ -267,7 +270,7 @@ class NBodyH5SnapshotCollector:
     def __repr__(self):
         repr_str = (
             f"{self.__class__.__name__}(\n"
-            f'  nbody_simulation_root="{os.path.abspath(self._nbody_sim_root)}",\n'
+            f'  nbody_simulation_root="{os.path.abspath(self._nbody_sim_root or "")}",\n'
             f"  attribute_labels={self._attr_labels}\n"
         )
         if self._raw_collection_dict:

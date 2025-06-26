@@ -4,6 +4,9 @@ from datetime import datetime
 import click
 import pytorch_lightning as pl
 import torch
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning.loggers import CSVLogger
+from sklearn.preprocessing import MinMaxScaler
 
 from model.transformer import NBodyTransformerRegressor
 from module.data import NBodyDataModule
@@ -73,9 +76,9 @@ def train(
         snapshots_pairs=sampler.sampled_snapshot_pairs,
         snapshot_scalar_dict={},
         attr_tuple_scalar_dict={
-            0: "RobustScaler",
-            1: "RobustScaler",
-            2: "RobustScaler",
+            0: MinMaxScaler(),
+            1: MinMaxScaler(),
+            2: MinMaxScaler(),
         },
         batch_size=batch_size,
         val_frac=val_frac,
@@ -101,13 +104,13 @@ def train(
         max_epochs=max_epochs,
         accelerator="auto",
         devices="auto",
-        logger=pl.loggers.CSVLogger(
+        logger=CSVLogger(
             save_dir="../output/logs",
             name=model_hyper_param_str,
             version=start_time_str,
         ),
         callbacks=[
-            pl.callbacks.ModelCheckpoint(
+            ModelCheckpoint(
                 dirpath="../output/checkpoints",
                 monitor="val_mse",
                 mode="min",
@@ -115,10 +118,10 @@ def train(
                 filename=(
                     f"{start_time_str}-tf_regression-{model_hyper_param_str}-"
                     "{epoch:03d}-"
-                    "{val_loss:.4f}"
+                    "{val_mse:.4f}"
                 ),
             ),
-            pl.callbacks.EarlyStopping(
+            EarlyStopping(
                 monitor="val_mse",
                 patience=10,
                 mode="min",
@@ -128,7 +131,6 @@ def train(
     )
 
     trainer.fit(model, datamodule=data_module)
-
 
 if __name__ == "__main__":
     train()
