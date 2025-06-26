@@ -174,22 +174,16 @@ class NBodyTransformerRegressor(pl.LightningModule):
         self._evaluation(batch, "val")
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(
+        optimizer = torch.optim.Adam(
             self.parameters(),
             lr=self.hparams.lr,
-            weight_decay=5e-4,
-            betas=(0.85, 0.995),
-            eps=1e-8,
+            weight_decay=1e-5,
         )
 
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            max_lr=self.hparams.lr * 20,
-            total_steps=self.trainer.estimated_stepping_batches,
-            pct_start=0.05,
-            anneal_strategy="cos",
-            div_factor=20,
-            final_div_factor=200,
+            T_max=self.trainer.estimated_stepping_batches,
+            eta_min=self.hparams.lr / 10,
         )
 
         return {
@@ -197,6 +191,5 @@ class NBodyTransformerRegressor(pl.LightningModule):
             "lr_scheduler": {
                 "scheduler": scheduler,
                 "interval": "step",
-                "frequency": 1,
             },
         }

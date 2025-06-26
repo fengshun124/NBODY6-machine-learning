@@ -4,13 +4,13 @@ from datetime import datetime
 import click
 import pytorch_lightning as pl
 import torch
-from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
-from pytorch_lightning.loggers import CSVLogger
-from sklearn.preprocessing import MinMaxScaler
-
 from model.transformer import NBodyTransformerRegressor
 from module.data import NBodyDataModule
 from module.sampler import NBodySnapshotNonEmptySampler
+
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning.loggers import CSVLogger
+from sklearn.preprocessing import MinMaxScaler
 
 RANDOM_SEED = 42
 
@@ -53,6 +53,7 @@ def train(
     start_time = datetime.now()
     start_time_str = start_time.strftime("%Y%m%d-%H%M%S")
     model_hyper_param_str = (
+        f"val{f'{val_frac:.2f}'.replace('.', 'p')}-"
         f"hd{hidden_dim}-"
         f"h{num_heads}-"
         f"ind{num_inducing}-"
@@ -131,6 +132,7 @@ def train(
     )
 
     trainer.fit(model, datamodule=data_module)
+
 
 if __name__ == "__main__":
     train()

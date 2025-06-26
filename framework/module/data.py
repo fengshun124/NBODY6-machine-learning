@@ -67,6 +67,9 @@ class NBodyDataModule(pl.LightningDataModule):
         self.val_dataset: Optional[NBodyDataset] = None
 
     def setup(self, stage: Optional[str] = None) -> None:
+        np.random.seed(self._random_seed)
+        torch.manual_seed(self._random_seed)
+        
         label_encoders = {}
         if self._raw_snapshot_pairs:
             num_attributes = len(self._raw_snapshot_pairs[0])
