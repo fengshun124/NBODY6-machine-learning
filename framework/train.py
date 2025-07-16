@@ -4,13 +4,13 @@ from datetime import datetime
 import click
 import pytorch_lightning as pl
 import torch
-from model.transformer import NBodyTransformerRegressor
-from module.data import NBodyDataModule
-from module.sampler import NBodySnapshotNonEmptySampler
-
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import CSVLogger
 from sklearn.preprocessing import MinMaxScaler
+
+from model.transformer import NBodyTransformerRegressor
+from module.data import NBodyDataModule
+from module.nbody6pp.sampler import NBody6PPSnapshotCustomSampler
 
 RANDOM_SEED = 42
 
@@ -64,7 +64,7 @@ def train(
     )
     print(f'Registering model: "{model_hyper_param_str}/{start_time_str}"')
 
-    sampler = NBodySnapshotNonEmptySampler(nbody_simulation_root=data_path)
+    sampler = NBody6PPSnapshotCustomSampler(nbody_simulation_root=data_path)
     sampler.collect()
     sampler.sample(
         n_star_per_sample=256,

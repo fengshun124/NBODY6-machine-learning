@@ -36,7 +36,7 @@ SIM_ATTR_EXTRACT_CONFIG_DICT = {
 logger = logging.getLogger(__name__)
 
 
-class NBodyH5SnapshotCollector:
+class NBody6PPH5SnapshotCollector:
     def __init__(
         self,
         nbody_simulation_root: Optional[str],
@@ -295,7 +295,7 @@ class NBodyH5SnapshotCollector:
 def test():
     root_dir = "../../data/N10k"
 
-    collector = NBodyH5SnapshotCollector(nbody_simulation_root=root_dir)
+    collector = NBody6PPH5SnapshotCollector(nbody_simulation_root=root_dir)
     collector.collect(num_jobs=-1)
     print(collector)
 

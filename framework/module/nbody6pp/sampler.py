@@ -13,7 +13,7 @@ RANDOM_SEED = 42
 logger = logging.getLogger(__name__)
 
 
-class NBodySnapshotSamplerBase(ABC):
+class NBody6PPSnapshotSamplerBase(ABC):
     def __init__(
         self,
         nbody_simulation_root: Optional[str] = None,
@@ -175,7 +175,8 @@ class NBodySnapshotSamplerBase(ABC):
                 repr(self._collector)
                 .replace("\n", "\n  ")
                 .replace(
-                    "NBodyH5SnapshotCollector", "  collector=NBodyH5SnapshotCollector"
+                    f"{self._collector.__class__.__name__}",
+                    f"  collector={self._collector.__class__.__name__}"
                 )
             )
             repr_str += f"\n{collector_repr},\n"
@@ -196,7 +197,7 @@ class NBodySnapshotSamplerBase(ABC):
         return repr_str
 
 
-class NBodySnapshotNonEmptySampler(NBodySnapshotSamplerBase):
+class NBody6PPSnapshotCustomSampler(NBody6PPSnapshotSamplerBase):
     @staticmethod
     def _sample_snapshot(snapshot_df, attr_tuple, sample_strategy_dict):
         n_star_per_sample = sample_strategy_dict.get("n_star_per_sample", 256)
@@ -261,7 +262,7 @@ class NBodySnapshotNonEmptySampler(NBodySnapshotSamplerBase):
 
 
 def test():
-    sampler = NBodySnapshotNonEmptySampler(nbody_simulation_root="../../data/N15k")
+    sampler = NBody6PPSnapshotCustomSampler(nbody_simulation_root="../../data/N15k")
     sampler.collect()
     print(sampler)
 
