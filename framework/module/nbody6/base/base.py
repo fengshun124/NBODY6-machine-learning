@@ -53,11 +53,8 @@ class NBody6OutputFile(ABC):
     @property
     def data_list(
         self,
-    ) -> List[Dict[str, Union[Dict[str, Any], pd.DataFrame]]]:
-        if self._data is None:
-            warnings.warn("Data not loaded. Please call load() first.", UserWarning)
-            return []
-        return list(self._data.values())
+    ) -> Optional[List[Tuple[float, Dict[str, Union[Dict[str, Any], pd.DataFrame]]]]]:
+        return list(self.data_dict.items()) if self.data_dict else None
 
     def load(self, is_strict: bool = True):
         if self._data:

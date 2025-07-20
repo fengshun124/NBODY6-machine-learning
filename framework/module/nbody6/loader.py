@@ -1,8 +1,11 @@
 import warnings
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
+import astropy.units as u
+import numpy as np
 import pandas as pd
+from astropy.constants import L_sun, R_sun, sigma_sb
 
 from module.nbody6.base.base import NBody6OutputFile
 from module.nbody6.base.fort82 import NBody6Fort82
@@ -17,6 +20,7 @@ class NBody6OutputLoader:
 
         self._file_dict: Dict[str, NBody6OutputFile] = {}
         self._init_file_dict()
+        self._is_file_dict_loaded = False
 
         self._snapshot_dict: Optional[
             Dict[float, Dict[str, Union[Dict[str, any], pd.DataFrame]]]
@@ -40,8 +44,10 @@ class NBody6OutputLoader:
 
     def load(self, is_strict: bool = True) -> Dict[str, NBody6OutputFile]:
         # check if files are already loaded. If so, reset them.
-        if any(nbody6_file.data_dict for nbody6_file in self._file_dict.values()):
-            warnings.warn("Files are already loaded. Reloading them.")
+        if self._is_file_dict_loaded:
+            warnings.warn(
+                "Files are already loaded. Existing data will be cleared before reloading."
+            )
             self._init_file_dict()
 
         if not is_strict:
@@ -78,15 +84,151 @@ class NBody6OutputLoader:
         # set standard timestamps to OUT34
         self._timestamps = list(timestamp_dict["OUT34"])
 
+        self._is_file_dict_loaded = True
         return self._file_dict
 
-    def merge(self) -> Dict[float, Dict[str, Union[Dict[str, any], pd.DataFrame]]]:
-        for timestamp in self._timestamps:
-            pass
+    @property
+    def snapshot_dict(
+        self,
+    ) -> Optional[Dict[float, Dict[str, Union[Dict[str, any], pd.DataFrame]]]]:
+        if self._snapshot_dict is None:
+            warnings.warn("Snapshot dictionary is not initialized. Call merge() first.")
+            return None
+        if not self._is_file_dict_loaded:
+            warnings.warn("File dictionary is not loaded. Call load() first.")
+        return self._snapshot_dict
 
-    # def _merge(self, timestamp: float):
-    #     # extract snapshots with header and data from corresponding timestamp
-    #     out34_snapshot = self._file_dict["OUT34"][timestamp]
-    #     out9_snapshot = self._file_dict["OUT9"][timestamp]
-    #     fort82_snapshot = self._file_dict["fort.82"][timestamp]
-    #     fort83_snapshot = self._file_dict["fort.83"][timestamp]
+    @property
+    def snapshot_list(
+        self,
+    ) -> Optional[List[Tuple[float, Dict[str, Union[Dict[str, any], pd.DataFrame]]]]]:
+        return list(self.snapshot_dict.items()) if self.snapshot_dict else None
+
+    def merge(self) -> Dict[float, Dict[str, Union[Dict[str, any], pd.DataFrame]]]:
+        self._snapshot_dict = {}
+        for timestamp in self._timestamps:
+            self._snapshot_dict[timestamp] = self._merge(timestamp)
+
+        return self._snapshot_dict
+
+    def _merge(self, timestamp: float):
+        # extract snapshots with header and data from corresponding timestamp
+        out34_snapshot = self._file_dict["OUT34"][timestamp]
+        out9_snapshot = self._file_dict["OUT9"][timestamp]
+        fort82_snapshot = self._file_dict["fort.82"][timestamp]
+        fort83_snapshot = self._file_dict["fort.83"][timestamp]
+
+        reg_bin_df = pd.merge(
+            out9_snapshot["data"],
+            fort82_snapshot["data"],
+            on=["name1", "name2"],
+            how="outer",
+            suffixes=("_out9", "_fort82"),
+        )
+
+        # convert from logarithmic to linear scale
+        # L/L_sun = 10^(`log10(L/L_sun)[zlum]`)
+        reg_bin_df["_l1"] = np.power(10, reg_bin_df["zlum1"])
+        reg_bin_df["_l2"] = np.power(10, reg_bin_df["zlum2"])
+        # R/R_sun = 10^(`log10(R/R_sun)[rad]`)
+        reg_bin_df["_r1"] = np.power(10, reg_bin_df["rad1"])
+        reg_bin_df["_r2"] = np.power(10, reg_bin_df["rad2"])
+
+        # effective luminosity
+        # L_eff / L_sun = (L1 + L2) / L_sun = L1/L_sun + L2/L_sun
+        reg_bin_df["L_sol"] = reg_bin_df["_l1"] + reg_bin_df["_l2"]
+        # effective radius
+        # R_eff / R_sun = sqrt(R1^2 + R2^2) / R_sun = sqrt((R1/R_sun)^2 + (R2/R_sun)^2)
+        reg_bin_df["R_sol"] = np.sqrt(
+            np.power(reg_bin_df["_r1"], 2) + np.power(reg_bin_df["_r2"], 2)
+        )
+        # effective temperature
+        # T_eff = (L_eff / (4 * pi * R_eff^2 * sigma_sb))^(1/4)
+        reg_bin_df["T_eff"] = [
+            (((L_sol * L_sun) / (4 * np.pi * (R_sol * R_sun) ** 2 * sigma_sb)) ** 0.25)
+            .to(u.K)
+            .value
+            for L_sol, R_sol in zip(
+                reg_bin_df["L_sol"],
+                reg_bin_df["R_sol"],
+            )
+        ]
+        reg_bin_df.rename(
+            columns={
+                "L_sol": "L_sol_reg_bin",
+                "R_sol": "R_sol_reg_bin",
+                "T_eff": "T_eff_reg_bin",
+            },
+            inplace=True,
+        )
+
+        single_df = fort83_snapshot["data"].copy()
+        # T_eff = 10^(log10(T_eff))
+        single_df["T_eff_single"] = np.power(10, single_df["tempe"])
+        # L/L_sun = 10^(log10(L/L_sun))
+        single_df["L_sol_single"] = np.power(10, single_df["zlum"])
+        # R/R_sun = 10^(log10(R/R_sun))
+        single_df["R_sol_single"] = np.power(10, single_df["rad"])
+
+        # merge binary into main snapshot
+        merged_snapshot = pd.merge(
+            out34_snapshot["data"],
+            reg_bin_df[["cmName", "T_eff_reg_bin", "L_sol_reg_bin", "R_sol_reg_bin"]],
+            left_on="name",
+            right_on="cmName",
+            how="left",
+        )
+        # merge single stars into main snapshot
+        merged_snapshot = pd.merge(
+            merged_snapshot,
+            single_df[["name", "T_eff_single", "L_sol_single", "R_sol_single"]],
+            on="name",
+            how="left",
+        )
+
+        # flag binary systems
+        merged_snapshot["is_binary"] = merged_snapshot["T_eff_reg_bin"].notna()
+
+        # merge columns
+        merged_snapshot["T_eff"] = merged_snapshot["T_eff_single"].combine_first(
+            merged_snapshot["T_eff_reg_bin"]
+        )
+        merged_snapshot["L_sol"] = merged_snapshot["L_sol_single"].combine_first(
+            merged_snapshot["L_sol_reg_bin"]
+        )
+        merged_snapshot["R_sol"] = merged_snapshot["R_sol_single"].combine_first(
+            merged_snapshot["R_sol_reg_bin"]
+        )
+        # surface flux with respect to solar units
+        # F/F_sun = (L/L_sun) / (R/R_sun)^2
+        merged_snapshot["F_sol"] = (
+            merged_snapshot["L_sol"] / merged_snapshot["R_sol"] ** 2
+        )
+        merged_snapshot["log_T_eff"] = np.log10(merged_snapshot["T_eff"])
+        merged_snapshot["log_L_sol"] = np.log10(merged_snapshot["L_sol"])
+        merged_snapshot["log_R_sol"] = np.log10(merged_snapshot["R_sol"])
+        merged_snapshot["log_F_sol"] = np.log10(merged_snapshot["F_sol"])
+
+        return {
+            "header": out34_snapshot["header"],
+            "data": merged_snapshot[
+                out34_snapshot["data"].columns.tolist()
+                + [
+                    "T_eff",
+                    "L_sol",
+                    "R_sol",
+                    "F_sol",
+                    "log_T_eff",
+                    "log_L_sol",
+                    "log_R_sol",
+                    "log_F_sol",
+                    "is_binary",
+                ]
+            ],
+            "raw": {
+                "OUT34": out34_snapshot["data"],
+                "OUT9": out9_snapshot["data"],
+                "fort.82": fort82_snapshot["data"],
+                "fort.83": fort83_snapshot["data"],
+            },
+        }
