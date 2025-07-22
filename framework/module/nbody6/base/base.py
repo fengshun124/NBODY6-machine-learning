@@ -89,6 +89,16 @@ class NBody6OutputFile(ABC):
                 )
 
                 timestamp = round(header_dict["time"], 2)
+
+                # warning if timestamp already exists
+                if timestamp in self._data:
+                    warnings.warn(
+                        f"[LINE {header_data[0]}] timestamp {timestamp} duplicated with "
+                        f"[LINE {self._data[timestamp]['header_ln_range']}]. "
+                        "Keeping the last occurrence.",
+                        UserWarning,
+                    )
+
                 self._data[timestamp] = {
                     "header": header_dict,
                     "data": data_df,

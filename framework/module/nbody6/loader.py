@@ -36,6 +36,9 @@ class NBody6OutputLoader:
             "fort.83": NBody6Fort83(self._root / "fort.83"),
         }
 
+    def __repr__(self):
+        return f"NBody6OutputLoader(root={self._root})"
+
     @property
     def file_dict(self) -> Dict[str, NBody6OutputFile]:
         if not self._file_dict:
@@ -118,6 +121,28 @@ class NBody6OutputLoader:
         fort82_snapshot = self._file_dict["fort.82"][timestamp]
         fort83_snapshot = self._file_dict["fort.83"][timestamp]
 
+        xyz_conversion = out34_snapshot["header"]["rbar"]
+        uvw_conversion = out34_snapshot["header"]["vstar"]
+
+        # convert N.B unit to physical units
+        merged_snapshot = out34_snapshot["data"].copy()
+        # append suffix `_NB` to mark N.B units
+        merged_snapshot.rename(
+            columns={
+                "x": "x_NB",
+                "y": "y_NB",
+                "z": "z_NB",
+                "vx": "vx_NB",
+                "vy": "vy_NB",
+                "vz": "vz_NB",
+            },
+            inplace=True,
+        )
+        for col in ["x", "y", "z"]:
+            merged_snapshot[col] = merged_snapshot[f"{col}_NB"] * xyz_conversion
+        for col in ["vx", "vy", "vz"]:
+            merged_snapshot[col] = merged_snapshot[f"{col}_NB"] * uvw_conversion
+
         reg_bin_df = pd.merge(
             out9_snapshot["data"],
             fort82_snapshot["data"],
@@ -172,7 +197,7 @@ class NBody6OutputLoader:
 
         # merge binary into main snapshot
         merged_snapshot = pd.merge(
-            out34_snapshot["data"],
+            merged_snapshot,
             reg_bin_df[["cmName", "T_eff_reg_bin", "L_sol_reg_bin", "R_sol_reg_bin"]],
             left_on="name",
             right_on="cmName",
