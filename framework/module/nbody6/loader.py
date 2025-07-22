@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import astropy.units as u
+import joblib
 import numpy as np
 import pandas as pd
 from astropy.constants import L_sun, R_sun, sigma_sb
@@ -257,3 +258,20 @@ class NBody6OutputLoader:
                 "fort.83": fort83_snapshot["data"],
             },
         }
+
+    def export_snapshot_dict(
+        self, output_path: Union[str, Path], overwrite: bool = False
+    ) -> None:
+        if self._snapshot_dict is None:
+            raise ValueError(
+                "Snapshot dictionary is not initialized. Call merge() first."
+            )
+
+        output_path = Path(output_path).resolve()
+        if output_path.exists() and not overwrite:
+            raise FileExistsError(
+                f"File `{output_path}` already exists. Use overwrite=True to force overwrite."
+            )
+
+        joblib.dump(self._snapshot_dict, output_path)
+        print(f"Snapshot dictionary exported to `{output_path}`.")

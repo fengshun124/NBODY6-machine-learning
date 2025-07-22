@@ -62,10 +62,8 @@ class NBody6OutputFile(ABC):
                 f"Reloading {self._filepath}, all previous data will be discarded.",
                 UserWarning,
             )
-
-        # Initialize _data as an empty dictionary
         self._data = {}
-
+        
         for header_data, row_data in self._parse_file():
             try:
                 header_dict = self._map_tokens(
