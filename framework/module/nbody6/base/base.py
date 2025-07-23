@@ -42,6 +42,16 @@ class NBody6OutputFile(ABC):
             return []
         return list(self._data.keys())
 
+    def update_timestamp(self, old_timestamp: float, new_timestamp: float) -> None:
+        if self._data is None:
+            raise ValueError("Data not loaded. Please call load() first.")
+        if old_timestamp not in self._data:
+            raise KeyError(f"Timestamp {old_timestamp} not found in data.")
+        if new_timestamp in self._data:
+            raise KeyError(f"Timestamp {new_timestamp} already exists in data.")
+
+        self._data[new_timestamp] = self._data.pop(old_timestamp)
+
     @property
     def data_dict(
         self,
@@ -63,7 +73,7 @@ class NBody6OutputFile(ABC):
                 UserWarning,
             )
         self._data = {}
-        
+
         for header_data, row_data in self._parse_file():
             try:
                 header_dict = self._map_tokens(
@@ -79,6 +89,7 @@ class NBody6OutputFile(ABC):
                     )
                     for row in row_data
                 ]
+
                 sort_key = "name" if "name" in self._config["row_schema"] else "name1"
                 data_df = (
                     pd.DataFrame.from_records(row_dicts)
@@ -184,6 +195,15 @@ class NBody6OutputFile(ABC):
                 else:
                     value = [tokens[i] for i in idx]
                 mapped_data[key] = converter(value)
+
+                # special treatment for `name` keys (`name` / `name1` & `name2`)
+                # it MUST be positive integer
+                if key.startswith("name") and mapped_data[key] <= 0:
+                    raise ValueError(
+                        f"[LINE {ln_num}] Invalid value for '{key}': {mapped_data[key]}. "
+                        "It must be a positive integer."
+                    )
+
             except IndexError:
                 if allow_missing:
                     mapped_data[key] = None

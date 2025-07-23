@@ -41,6 +41,10 @@ class NBody6OutputLoader:
         return f"NBody6OutputLoader(root={self._root})"
 
     @property
+    def root(self) -> Path:
+        return self._root
+
+    @property
     def file_dict(self) -> Dict[str, NBody6OutputFile]:
         if not self._file_dict:
             warnings.warn("File dictionary is empty. Call load() first.")
@@ -86,8 +90,15 @@ class NBody6OutputLoader:
                 )
 
         # set standard timestamps to OUT34
-        self._timestamps = list(timestamp_dict["OUT34"])
+        ref_timestamps = list(timestamp_dict["OUT34"])
+        for name, nbody6_file in self._file_dict.items():
+            if name == "OUT34":
+                continue
+            for ts, ref_ts in zip(nbody6_file.timestamps, ref_timestamps):
+                if ts != ref_ts:
+                    nbody6_file.update_timestamp(ts, ref_ts)
 
+        self._timestamps = ref_timestamps
         self._is_file_dict_loaded = True
         return self._file_dict
 
