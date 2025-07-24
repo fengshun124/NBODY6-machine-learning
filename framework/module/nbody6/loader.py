@@ -8,11 +8,12 @@ import numpy as np
 import pandas as pd
 from astropy.constants import L_sun, R_sun, sigma_sb
 
-from module.nbody6.base.base import NBody6OutputFile
-from module.nbody6.base.fort82 import NBody6Fort82
-from module.nbody6.base.fort83 import NBody6Fort83
-from module.nbody6.base.out9 import NBody6OUT9
-from module.nbody6.base.out34 import NBody6OUT34
+from module.nbody6.plot.animate import animate_nbody6_snapshots
+from module.nbody6.file.base import NBody6OutputFile
+from module.nbody6.file.fort82 import NBody6Fort82
+from module.nbody6.file.fort83 import NBody6Fort83
+from module.nbody6.file.out9 import NBody6OUT9
+from module.nbody6.file.out34 import NBody6OUT34
 
 
 class NBody6OutputLoader:
@@ -286,3 +287,23 @@ class NBody6OutputLoader:
 
         joblib.dump(self._snapshot_dict, output_path)
         print(f"Snapshot dictionary exported to `{output_path}`.")
+
+    def animate_snapshots(
+        self,
+        output_path: Optional[Union[str, Path]] = None,
+        fig_title_text: Optional[str] = None,
+        animation_fps: int = 10,
+        animation_dpi: int = 300,
+    ):
+        snapshot_list = self.snapshot_list
+        if not snapshot_list:
+            raise ValueError("No snapshots available to animate.")
+
+        animation = animate_nbody6_snapshots(
+            snapshot_list=snapshot_list,
+            output_path=output_path,
+            fig_title_text=fig_title_text,
+            animation_fps=animation_fps,
+            animation_dpi=animation_dpi,
+        )
+        return animation

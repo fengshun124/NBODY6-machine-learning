@@ -3,7 +3,7 @@ from typing import Union
 
 import numpy as np
 
-from module.nbody6.base.base import NBody6OutputFile
+from module.nbody6.file.base import NBody6OutputFile
 
 
 class NBody6OUT34(NBody6OutputFile):
