@@ -1,6 +1,6 @@
 import warnings
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Any
 
 import astropy.units as u
 import joblib
@@ -8,12 +8,12 @@ import numpy as np
 import pandas as pd
 from astropy.constants import L_sun, R_sun, sigma_sb
 
-from module.nbody6.plot.animate import animate_nbody6_snapshots
 from module.nbody6.file.base import NBody6OutputFile
 from module.nbody6.file.fort82 import NBody6Fort82
 from module.nbody6.file.fort83 import NBody6Fort83
 from module.nbody6.file.out9 import NBody6OUT9
 from module.nbody6.file.out34 import NBody6OUT34
+from module.nbody6.plot.animate import animate_nbody6_snapshots
 
 
 class NBody6OutputLoader:
@@ -65,7 +65,10 @@ class NBody6OutputLoader:
             )
 
         for filename, nbody6_file in self._file_dict.items():
-            nbody6_file.load(is_strict=is_strict)
+            try:
+                nbody6_file.load(is_strict=is_strict)
+            except Exception as e:
+                raise ValueError(f"Error loading {self._root / filename}: {e}") from e
 
         # check if all files share the same timestamps with tolerance of 1e-2
         timestamp_dict = {
@@ -120,41 +123,45 @@ class NBody6OutputLoader:
     ) -> Optional[List[Tuple[float, Dict[str, Union[Dict[str, any], pd.DataFrame]]]]]:
         return list(self.snapshot_dict.items()) if self.snapshot_dict else None
 
-    def merge(self) -> Dict[float, Dict[str, Union[Dict[str, any], pd.DataFrame]]]:
+    def merge(
+        self, is_strict: bool = True
+    ) -> Dict[float, Dict[str, Union[Dict[str, any], pd.DataFrame]]]:
         self._snapshot_dict = {}
         for timestamp in self._timestamps:
-            self._snapshot_dict[timestamp] = self._merge(timestamp)
+            snapshot_data = self._merge(timestamp)
+
+            # check if snapshot_df contains NaN values
+            snapshot_df = snapshot_data["data"]
+            if snapshot_df.isnull().values.any():
+                nan_rows = snapshot_df[snapshot_df.isnull().any(axis=1)]
+                nan_names = nan_rows["name"].tolist()
+
+                msg_text = (
+                    f"Snapshot at {timestamp} contains NaN values. "
+                    "Possibly due to misaligned `name` values across files. "
+                    f"Names with NaN values: {nan_names}. "
+                )
+
+                if is_strict:
+                    raise ValueError(
+                        msg_text + "\nSet `is_strict=False` to ignore this check."
+                    )
+                else:
+                    warnings.warn(msg_text + "\nRows with NaN values will be dropped.")
+                    snapshot_data["data"] = snapshot_df.dropna()
+
+            self._snapshot_dict[timestamp] = snapshot_data
 
         return self._snapshot_dict
 
-    def _merge(self, timestamp: float):
+    def _merge(
+        self, timestamp: float
+    ) -> Dict[str, Union[Dict[str, Any], pd.DataFrame, Dict[str, NBody6OutputFile]]]:
         # extract snapshots with header and data from corresponding timestamp
         out34_snapshot = self._file_dict["OUT34"][timestamp]
         out9_snapshot = self._file_dict["OUT9"][timestamp]
         fort82_snapshot = self._file_dict["fort.82"][timestamp]
         fort83_snapshot = self._file_dict["fort.83"][timestamp]
-
-        xyz_conversion = out34_snapshot["header"]["rbar"]
-        uvw_conversion = out34_snapshot["header"]["vstar"]
-
-        # convert N.B unit to physical units
-        merged_snapshot = out34_snapshot["data"].copy()
-        # append suffix `_NB` to mark N.B units
-        merged_snapshot.rename(
-            columns={
-                "x": "x_NB",
-                "y": "y_NB",
-                "z": "z_NB",
-                "vx": "vx_NB",
-                "vy": "vy_NB",
-                "vz": "vz_NB",
-            },
-            inplace=True,
-        )
-        for col in ["x", "y", "z"]:
-            merged_snapshot[col] = merged_snapshot[f"{col}_NB"] * xyz_conversion
-        for col in ["vx", "vy", "vz"]:
-            merged_snapshot[col] = merged_snapshot[f"{col}_NB"] * uvw_conversion
 
         reg_bin_df = pd.merge(
             out9_snapshot["data"],
@@ -182,15 +189,11 @@ class NBody6OutputLoader:
         )
         # effective temperature
         # T_eff = (L_eff / (4 * pi * R_eff^2 * sigma_sb))^(1/4)
-        reg_bin_df["T_eff"] = [
-            (((L_sol * L_sun) / (4 * np.pi * (R_sol * R_sun) ** 2 * sigma_sb)) ** 0.25)
-            .to(u.K)
-            .value
-            for L_sol, R_sol in zip(
-                reg_bin_df["L_sol"],
-                reg_bin_df["R_sol"],
-            )
-        ]
+        L_eff = reg_bin_df["L_sol"].values * L_sun
+        R_eff = reg_bin_df["R_sol"].values * R_sun
+        reg_bin_df["T_eff"] = (
+            (np.power(L_eff / (4 * np.pi * R_eff**2 * sigma_sb), 1 / 4)).to(u.K).value
+        )
         reg_bin_df.rename(
             columns={
                 "L_sol": "L_sol_reg_bin",
@@ -210,7 +213,7 @@ class NBody6OutputLoader:
 
         # merge binary into main snapshot
         merged_snapshot = pd.merge(
-            merged_snapshot,
+            out34_snapshot["data"],
             reg_bin_df[["cmName", "T_eff_reg_bin", "L_sol_reg_bin", "R_sol_reg_bin"]],
             left_on="name",
             right_on="cmName",
@@ -307,3 +310,27 @@ class NBody6OutputLoader:
             animation_dpi=animation_dpi,
         )
         return animation
+
+    def get_statistics(self) -> Optional[pd.DataFrame]:
+        if self._snapshot_dict is None:
+            warnings.warn("Snapshot dictionary is not initialized. Call merge() first.")
+            return None
+
+        simulation_stats = []
+        for timestamp, snapshot_data in self._snapshot_dict.items():
+            header = snapshot_data["header"]
+            snapshot_df = snapshot_data["data"]
+
+            simulation_stats.extend(
+                [
+                    {
+                        "age": header["time"],
+                        "tidal_radius": header["rtide"],
+                        "n_star": len(snapshot_df),
+                        "n_reg_binary": snapshot_df["is_binary"].sum(),
+                        "total_mass": snapshot_df["mass"].sum(),
+                    }
+                ]
+            )
+
+        return pd.DataFrame(simulation_stats).set_index("age").sort_index()

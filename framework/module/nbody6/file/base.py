@@ -13,6 +13,7 @@ class NBody6OutputFile(ABC):
         if not self._filepath.is_file():
             raise FileNotFoundError(f"File not found: {self._filepath}")
 
+        self._filename = self._filepath.name
         self._config = load_config
         self._data: Optional[
             Dict[float, Dict[str, Union[Dict[str, Any], pd.DataFrame]]]
@@ -33,7 +34,10 @@ class NBody6OutputFile(ABC):
             raise ValueError("Data not loaded. Please call load() first.")
         if timestamp not in self._data:
             raise KeyError(f"Timestamp {timestamp} not found in data.")
-        return self._data[timestamp]
+
+        data_dict = self._data[timestamp].copy()
+        data_dict.pop("_header_line", None)
+        return data_dict
 
     @property
     def timestamps(self) -> List[float]:
@@ -58,7 +62,10 @@ class NBody6OutputFile(ABC):
     ) -> Optional[Dict[float, Dict[str, Union[Dict[str, Any], pd.DataFrame]]]]:
         if self._data is None:
             warnings.warn("Data not loaded. Please call load() first.", UserWarning)
-        return self._data
+        return {
+            timestamp: {k: v for k, v in data.items() if not k.startswith("_")}
+            for timestamp, data in self._data.items()
+        }
 
     @property
     def data_list(
@@ -102,8 +109,9 @@ class NBody6OutputFile(ABC):
                 # warning if timestamp already exists
                 if timestamp in self._data:
                     warnings.warn(
+                        f"{self._filename} - "
                         f"[LINE {header_data[0]}] timestamp {timestamp} duplicated with "
-                        f"[LINE {self._data[timestamp]['header_ln_range']}]. "
+                        f"[LINE {self._data[timestamp]['_header_line']}]. "
                         "Keeping the last occurrence.",
                         UserWarning,
                     )
@@ -111,10 +119,13 @@ class NBody6OutputFile(ABC):
                 self._data[timestamp] = {
                     "header": header_dict,
                     "data": data_df,
+                    "_header_line": header_data[0],
                 }
 
             except Exception as e:
-                raise ValueError(f"Error processing file {self._filepath}: {e}") from e
+                raise ValueError(
+                    f"[{self._filename} - LINE {header_data[0]}] {e}"
+                ) from e
 
         # sort the data by timestamp
         self._data = dict(sorted(self._data.items()))
@@ -150,7 +161,8 @@ class NBody6OutputFile(ABC):
                 for ln_num, header_line in group:
                     if not header_line:
                         warnings.warn(
-                            f"[LINE {ln_num}] Empty header line found in {self._filepath}, "
+                            f"[{self._filename} - LINE {ln_num}] "
+                            f"Empty header line found in {self._filepath}, "
                             "possibly malformed file, skipping.",
                         )
                         continue
@@ -179,8 +191,8 @@ class NBody6OutputFile(ABC):
                     [(ln_num, line.split()) for ln_num, line in row_data],
                 )
 
-    @staticmethod
     def _map_tokens(
+        self,
         ln_data: Tuple[Union[str, int], list[str]],
         schema: Dict[str, Tuple[Union[int, List[int]], Callable]],
         allow_missing: bool = False,
@@ -197,27 +209,21 @@ class NBody6OutputFile(ABC):
                 mapped_data[key] = converter(value)
 
                 # special treatment for `name` keys (`name` / `name1` & `name2`)
-                # it MUST be positive integer
                 if key.startswith("name") and mapped_data[key] <= 0:
-                    raise ValueError(
-                        f"[LINE {ln_num}] Invalid value for '{key}': {mapped_data[key]}. "
-                        "It must be a positive integer."
+                    warnings.warn(
+                        f"[{self._filename} - LINE {ln_num}] "
+                        f"Invalid value for '{key}': {mapped_data[key]}. "
                     )
 
             except IndexError:
                 if allow_missing:
                     mapped_data[key] = None
                 else:
-                    raise ValueError(
-                        f"[LINE {ln_num}] Missing required token '{key}' at index {idx} "
-                        f"in {tokens}"
-                    )
+                    raise ValueError(f"Missing required token '{key}' at index {idx}")
             except Exception as e:
-                raise ValueError(
-                    f"[LINE {ln_num}] Error converting token '{key}' with value '{value}': {e}"
-                )
+                raise ValueError(e)
 
         if not mapped_data:
-            raise ValueError(f"[LINE {ln_num}] No valid tokens found in {tokens}")
+            raise ValueError(f"No valid tokens found in {tokens}")
 
         return mapped_data
