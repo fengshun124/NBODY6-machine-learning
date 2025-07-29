@@ -212,7 +212,7 @@ class NBody6OutputFile(ABC):
                 if key.startswith("name") and mapped_data[key] <= 0:
                     warnings.warn(
                         f"[{self._filename} - LINE {ln_num}] "
-                        f"Invalid value for '{key}': {mapped_data[key]}. "
+                        f"Possibly multiple systems '{key}': {mapped_data[key]}. "
                     )
 
             except IndexError:

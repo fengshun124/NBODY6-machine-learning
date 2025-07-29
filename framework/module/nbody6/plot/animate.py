@@ -13,10 +13,10 @@ from module.nbody6.plot.plot import visualize_nbody6_snapshot
 
 def animate_nbody6_snapshots(
     snapshot_list: List[Tuple[float, Dict[str, Union[Dict[str, Any], pd.DataFrame]]]],
+    output_path: Union[str, Path],
     fig_title_text: Optional[str] = None,
     animation_fps: int = 10,
     animation_dpi: int = 300,
-    output_path: Union[str, Path] = None,
 ) -> FuncAnimation:
     T_eff_major_locator, T_eff_minor_locator = 0.6, 0.2
     L_major_locator, L_minor_locator = 2, 0.2
@@ -39,7 +39,7 @@ def animate_nbody6_snapshots(
             hr_T_eff_plot_range=(2.8, 5.2),
             hr_T_eff_major_locator=T_eff_major_locator,
             hr_T_eff_minor_locator=T_eff_minor_locator,
-            hr_L_plot_range=(-4.4, 4.4),
+            hr_L_plot_range=(-5.4, 5.4),
             hr_L_major_locator=L_major_locator,
             hr_L_minor_locator=L_minor_locator,
             xyz_plot_limit=75,
@@ -67,7 +67,5 @@ def animate_nbody6_snapshots(
                 dpi=animation_dpi,
                 progress_callback=lambda i, n: pbar.update(1),
             )
-    else:
-        plt.show()
 
     return animation

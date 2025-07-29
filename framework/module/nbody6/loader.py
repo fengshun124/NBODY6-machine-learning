@@ -1,12 +1,13 @@
 import warnings
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union, Any
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import astropy.units as u
 import joblib
 import numpy as np
 import pandas as pd
 from astropy.constants import L_sun, R_sun, sigma_sb
+from matplotlib import pyplot as plt
 
 from module.nbody6.file.base import NBody6OutputFile
 from module.nbody6.file.fort82 import NBody6Fort82
@@ -80,6 +81,7 @@ class NBody6OutputLoader:
         timestamp_len_dict = {name: len(ts) for name, ts in timestamp_dict.items()}
         if len(set(timestamp_len_dict.values())) > 1:
             raise ValueError(
+                f"Error merging {self._root}: "
                 f"Timestamp lengths mismatch: {timestamp_len_dict}. "
                 "All files must have the same number of timestamps."
             )
@@ -90,6 +92,7 @@ class NBody6OutputLoader:
                     name: ts[i] for name, ts in timestamp_dict.items()
                 }
                 raise ValueError(
+                    f"Error merging {self._root}: "
                     f"Timestamp mismatch at index {i}: {mismatched_timestamps}"
                 )
 
@@ -105,6 +108,29 @@ class NBody6OutputLoader:
         self._timestamps = ref_timestamps
         self._is_file_dict_loaded = True
         return self._file_dict
+
+    def get_snapshot(
+        self, timestamp: float
+    ) -> Optional[Dict[str, Union[Dict[str, any], pd.DataFrame]]]:
+        if not self._is_file_dict_loaded:
+            warnings.warn("File dictionary is not loaded. Call load() first.")
+            return None
+
+        if self._snapshot_dict is None:
+            warnings.warn("Snapshot dictionary is not initialized. Call merge() first.")
+            return None
+
+        if timestamp in self._snapshot_dict:
+            return self._snapshot_dict.get(timestamp)
+        else:
+            new_timestamp = self._timestamps[
+                np.argmin(np.abs(np.array(self._timestamps) - timestamp))
+            ]
+            warnings.warn(
+                f"Timestamp {timestamp} not found in snapshot dictionary. "
+                "Returning snapshot for closest timestamp {new_timestamp}."
+            )
+            return self._snapshot_dict.get(new_timestamp)
 
     @property
     def snapshot_dict(
@@ -163,6 +189,20 @@ class NBody6OutputLoader:
         fort82_snapshot = self._file_dict["fort.82"][timestamp]
         fort83_snapshot = self._file_dict["fort.83"][timestamp]
 
+        # calculate distance between stars and density center, in multiple of tidal radius
+        merged_snapshot = out34_snapshot["data"].copy()
+        pos_conv_factor = out34_snapshot["header"]["rbar"]
+        density_center = out34_snapshot["header"]["rd"] * pos_conv_factor
+
+        merged_snapshot["r_dc"] = (
+            np.sqrt(
+                (merged_snapshot["x"] - density_center[0]) ** 2
+                + (merged_snapshot["y"] - density_center[1]) ** 2
+                + (merged_snapshot["z"] - density_center[2]) ** 2
+            )
+            / out34_snapshot["header"]["rtide"]
+        )
+
         reg_bin_df = pd.merge(
             out9_snapshot["data"],
             fort82_snapshot["data"],
@@ -213,7 +253,7 @@ class NBody6OutputLoader:
 
         # merge binary into main snapshot
         merged_snapshot = pd.merge(
-            out34_snapshot["data"],
+            merged_snapshot,
             reg_bin_df[["cmName", "T_eff_reg_bin", "L_sol_reg_bin", "R_sol_reg_bin"]],
             left_on="name",
             right_on="cmName",
@@ -255,6 +295,7 @@ class NBody6OutputLoader:
             "data": merged_snapshot[
                 out34_snapshot["data"].columns.tolist()
                 + [
+                    "r_dc",
                     "T_eff",
                     "L_sol",
                     "R_sol",
@@ -293,7 +334,7 @@ class NBody6OutputLoader:
 
     def animate_snapshots(
         self,
-        output_path: Optional[Union[str, Path]] = None,
+        output_path: Union[str, Path],
         fig_title_text: Optional[str] = None,
         animation_fps: int = 10,
         animation_dpi: int = 300,
@@ -309,6 +350,10 @@ class NBody6OutputLoader:
             animation_fps=animation_fps,
             animation_dpi=animation_dpi,
         )
+
+        if not output_path:
+            plt.show()
+
         return animation
 
     def get_statistics(self) -> Optional[pd.DataFrame]:
@@ -333,4 +378,6 @@ class NBody6OutputLoader:
                 ]
             )
 
-        return pd.DataFrame(simulation_stats).set_index("age").sort_index()
+        return (
+            pd.DataFrame(simulation_stats).set_index("age").sort_index().reset_index()
+        )
