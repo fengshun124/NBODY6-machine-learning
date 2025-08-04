@@ -9,11 +9,11 @@ import pandas as pd
 
 class NBody6OutputFile(ABC):
     def __init__(self, filepath: Union[str, Path], load_config: Dict[str, Any]) -> None:
-        self._filepath = Path(filepath)
+        self._filepath = Path(filepath).resolve()
         if not self._filepath.is_file():
             raise FileNotFoundError(f"File not found: {self._filepath}")
 
-        self._filename = self._filepath.name
+        self._filename = str(self._filepath)
         self._config = load_config
         self._data: Optional[
             Dict[float, Dict[str, Union[Dict[str, Any], pd.DataFrame]]]

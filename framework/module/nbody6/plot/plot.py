@@ -60,7 +60,7 @@ def visualize_nbody6_snapshot(
         "\n"
         rf"$M_\mathrm{{total}}={snapshot_df['mass'].sum():.2f}\;M_\odot$"
         "\n"
-        rf"$R_\mathrm{{tidal}}={snapshot_header['rtide']:.2f}\;\mathrm{{pc}}$",
+        rf"$R_\mathrm{{tidal}}={snapshot_header['r_tidal']:.2f}\;\mathrm{{pc}}$",
         transform=info_ax.transAxes,
         va="bottom",
         ha="left",

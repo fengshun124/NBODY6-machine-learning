@@ -10,8 +10,10 @@ from astropy.constants import L_sun, R_sun, sigma_sb
 from matplotlib import pyplot as plt
 
 from module.nbody6.file.base import NBody6OutputFile
+from module.nbody6.file.fort19 import NBody6Fort19
 from module.nbody6.file.fort82 import NBody6Fort82
 from module.nbody6.file.fort83 import NBody6Fort83
+from module.nbody6.file.misc import NBody6DensityCenterFile
 from module.nbody6.file.out9 import NBody6OUT9
 from module.nbody6.file.out34 import NBody6OUT34
 from module.nbody6.plot.animate import animate_nbody6_snapshots
@@ -33,8 +35,10 @@ class NBody6OutputLoader:
 
     def _init_file_dict(self) -> None:
         self._file_dict = {
+            "densCentre.txt": NBody6DensityCenterFile(self._root / "densCentre.txt"),
             "OUT34": NBody6OUT34(self._root / "OUT34"),
             "OUT9": NBody6OUT9(self._root / "OUT9"),
+            "fort.19": NBody6Fort19(self._root / "fort.19"),
             "fort.82": NBody6Fort82(self._root / "fort.82"),
             "fort.83": NBody6Fort83(self._root / "fort.83"),
         }
@@ -45,6 +49,12 @@ class NBody6OutputLoader:
     @property
     def root(self) -> Path:
         return self._root
+
+    @property
+    def timestamps(self) -> Optional[List[float]]:
+        if not self._timestamps:
+            warnings.warn("Timestamps are not loaded. Call load() first.")
+        return self._timestamps
 
     @property
     def file_dict(self) -> Dict[str, NBody6OutputFile]:
@@ -69,7 +79,7 @@ class NBody6OutputLoader:
             try:
                 nbody6_file.load(is_strict=is_strict)
             except Exception as e:
-                raise ValueError(f"Error loading {self._root / filename}: {e}") from e
+                raise ValueError(f'Error loading "{filename}": {e}') from e
 
         # check if all files share the same timestamps with tolerance of 1e-2
         timestamp_dict = {
@@ -128,7 +138,7 @@ class NBody6OutputLoader:
             ]
             warnings.warn(
                 f"Timestamp {timestamp} not found in snapshot dictionary. "
-                "Returning snapshot for closest timestamp {new_timestamp}."
+                f"Returning snapshot for closest timestamp {new_timestamp}."
             )
             return self._snapshot_dict.get(new_timestamp)
 
@@ -155,6 +165,10 @@ class NBody6OutputLoader:
         self._snapshot_dict = {}
         for timestamp in self._timestamps:
             snapshot_data = self._merge(timestamp)
+
+            # skip if snapshot_data is None (e.g., cluster has dissolved)
+            if snapshot_data is None:
+                break
 
             # check if snapshot_df contains NaN values
             snapshot_df = snapshot_data["data"]
@@ -186,21 +200,27 @@ class NBody6OutputLoader:
         # extract snapshots with header and data from corresponding timestamp
         out34_snapshot = self._file_dict["OUT34"][timestamp]
         out9_snapshot = self._file_dict["OUT9"][timestamp]
+        fort19_snapshot = self._file_dict["fort.19"][timestamp]
         fort82_snapshot = self._file_dict["fort.82"][timestamp]
         fort83_snapshot = self._file_dict["fort.83"][timestamp]
+        density_center_info = self._file_dict["densCentre.txt"][timestamp]
+
+        # skip if cluster has dissolved
+        if density_center_info["header"]["r_tidal"] < 0:
+            warnings.warn(
+                f"Cluster has dissolved at timestamp {timestamp}. "
+                "Skipping snapshot merge."
+            )
+            return None
 
         # calculate distance between stars and density center, in multiple of tidal radius
         merged_snapshot = out34_snapshot["data"].copy()
-        pos_conv_factor = out34_snapshot["header"]["rbar"]
-        density_center = out34_snapshot["header"]["rd"] * pos_conv_factor
 
-        merged_snapshot["r_dc"] = (
-            np.sqrt(
-                (merged_snapshot["x"] - density_center[0]) ** 2
-                + (merged_snapshot["y"] - density_center[1]) ** 2
-                + (merged_snapshot["z"] - density_center[2]) ** 2
-            )
-            / out34_snapshot["header"]["rtide"]
+        cluster_gal_position = (
+            out34_snapshot["header"]["rg"] * out34_snapshot["header"]["rbar"]
+        )
+        cluster_gal_velocity = (
+            out34_snapshot["header"]["vg"] * out34_snapshot["header"]["vstar"]
         )
 
         reg_bin_df = pd.merge(
@@ -290,12 +310,54 @@ class NBody6OutputLoader:
         merged_snapshot["log_R_sol"] = np.log10(merged_snapshot["R_sol"])
         merged_snapshot["log_F_sol"] = np.log10(merged_snapshot["F_sol"])
 
+        merged_snapshot["r_dc"] = np.linalg.norm(
+            merged_snapshot[["x", "y", "z"]].values
+            - np.array(
+                [
+                    density_center_info["header"]["density_center_x"],
+                    density_center_info["header"]["density_center_y"],
+                    density_center_info["header"]["density_center_z"],
+                ]
+            ),
+            axis=1,
+        )
+        merged_snapshot["r_dc_r_tidal"] = (
+            merged_snapshot["r_dc"] / density_center_info["header"]["r_tidal"]
+        )
+
+        header_dict = {
+            "time": out34_snapshot["header"]["time"],
+            "r_tidal": density_center_info["header"]["r_tidal"],
+            "cluster_density_center": (
+                density_center_info["header"]["density_center_x"],
+                density_center_info["header"]["density_center_y"],
+                density_center_info["header"]["density_center_z"],
+            ),
+            "r_tidal_out34": out34_snapshot["header"]["rtide"],
+            "cluster_density_center_out34": tuple(
+                map(float, out34_snapshot["header"]["rd"])
+            ),
+            "cluster_mass_center_out34": tuple(
+                map(float, out34_snapshot["header"]["rcm"])
+            ),
+            "cluster_gal_positionout_34": cluster_gal_position,
+            "cluster_gal_velocityout_34": cluster_gal_velocity,
+        }
+
         return {
-            "header": out34_snapshot["header"],
+            "header": header_dict,
             "data": merged_snapshot[
-                out34_snapshot["data"].columns.tolist()
-                + [
+                [
+                    "name",
+                    "x",
+                    "y",
+                    "z",
+                    "vx",
+                    "vy",
+                    "vz",
+                    "mass",
                     "r_dc",
+                    "r_dc_r_tidal",
                     "T_eff",
                     "L_sol",
                     "R_sol",
@@ -312,6 +374,7 @@ class NBody6OutputLoader:
                 "OUT9": out9_snapshot["data"],
                 "fort.82": fort82_snapshot["data"],
                 "fort.83": fort83_snapshot["data"],
+                "fort.19": fort19_snapshot["data"],
             },
         }
 
@@ -357,6 +420,20 @@ class NBody6OutputLoader:
         return animation
 
     def get_statistics(self) -> Optional[pd.DataFrame]:
+        def _describe_stats(
+            data_df: pd.DataFrame, key: str, prefix: Optional[str] = None
+        ) -> Dict[str, Any]:
+            prefix = f"{prefix}_" if prefix else ""
+            return {
+                f"{prefix}{key}_mean": data_df[key].mean(),
+                f"{prefix}{key}_std": data_df[key].std(),
+                f"{prefix}{key}_min": data_df[key].min(),
+                f"{prefix}{key}_q1": data_df[key].quantile(0.25),
+                f"{prefix}{key}_median": data_df[key].median(),
+                f"{prefix}{key}_q3": data_df[key].quantile(0.75),
+                f"{prefix}{key}_max": data_df[key].max(),
+            }
+
         if self._snapshot_dict is None:
             warnings.warn("Snapshot dictionary is not initialized. Call merge() first.")
             return None
@@ -366,18 +443,50 @@ class NBody6OutputLoader:
             header = snapshot_data["header"]
             snapshot_df = snapshot_data["data"]
 
+            snapshot_within_r_tidal_df = snapshot_df[snapshot_df["r_dc_r_tidal"] < 1]
+            snapshot_within_2x_r_tidal_df = snapshot_df[snapshot_df["r_dc_r_tidal"] < 2]
+
             simulation_stats.extend(
                 [
                     {
-                        "age": header["time"],
-                        "tidal_radius": header["rtide"],
+                        "time": header["time"],
+                        "r_tidal": header["r_tidal"],
+                        "cluster_density_center": header["cluster_density_center"],
                         "n_star": len(snapshot_df),
                         "n_reg_binary": snapshot_df["is_binary"].sum(),
+                        **_describe_stats(
+                            snapshot_df,
+                            "mass",
+                        ),
                         "total_mass": snapshot_df["mass"].sum(),
+                        "n_star_within_r_tidal": len(snapshot_within_r_tidal_df),
+                        "n_reg_binary_within_r_tidal": (
+                            snapshot_within_r_tidal_df["is_binary"].sum()
+                        ),
+                        **_describe_stats(
+                            snapshot_within_r_tidal_df,
+                            "mass",
+                            prefix="within_r_tidal",
+                        ),
+                        "total_mass_within_r_tidal": snapshot_within_r_tidal_df[
+                            "mass"
+                        ].sum(),
+                        "n_star_within_2x_r_tidal": len(snapshot_within_2x_r_tidal_df),
+                        "n_reg_binary_within_2x_r_tidal": (
+                            snapshot_within_2x_r_tidal_df["is_binary"].sum()
+                        ),
+                        **_describe_stats(
+                            snapshot_within_2x_r_tidal_df,
+                            "mass",
+                            prefix="within_2x_r_tidal",
+                        ),
+                        "total_mass_within_2x_r_tidal": snapshot_within_2x_r_tidal_df[
+                            "mass"
+                        ].sum(),
                     }
                 ]
             )
 
         return (
-            pd.DataFrame(simulation_stats).set_index("age").sort_index().reset_index()
+            pd.DataFrame(simulation_stats).sort_values(by="time").reset_index(drop=True)
         )
