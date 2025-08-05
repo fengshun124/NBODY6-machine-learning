@@ -1,6 +1,5 @@
 import warnings
 from abc import ABC
-from itertools import groupby
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -82,27 +81,40 @@ class NBody6OutputFile(ABC):
         self._data = {}
 
         for header_data, row_data in self._parse_file():
+            # line number reference for header block
+            header_ln_ref = header_data[0]
+
             try:
                 header_dict = self._map_tokens(
                     ln_data=header_data,
                     schema=self._config["header_schema"],
                     allow_missing=not is_strict,
                 )
-                row_dicts = [
-                    self._map_tokens(
-                        ln_data=row,
-                        schema=self._config["row_schema"],
-                        allow_missing=not is_strict,
-                    )
-                    for row in row_data
-                ]
 
-                sort_key = "name" if "name" in self._config["row_schema"] else "name1"
-                data_df = (
-                    pd.DataFrame.from_records(row_dicts)
-                    .sort_values(by=sort_key)
-                    .reset_index(drop=True)
-                )
+                row_dicts = []
+                for row_ln_num, row_tokens in row_data:
+                    try:
+                        row_dicts.append(
+                            self._map_tokens(
+                                ln_data=(row_ln_num, row_tokens),
+                                schema=self._config["row_schema"],
+                                allow_missing=not is_strict,
+                            )
+                        )
+                    except Exception as e:
+                        raise ValueError(f"LINE {row_ln_num}: {e}") from e
+
+                if row_dicts:
+                    sort_key = (
+                        "name" if "name" in self._config["row_schema"] else "name1"
+                    )
+                    data_df = (
+                        pd.DataFrame.from_records(row_dicts)
+                        .sort_values(by=sort_key)
+                        .reset_index(drop=True)
+                    )
+                else:
+                    data_df = pd.DataFrame(columns=self._config["row_schema"].keys())
 
                 timestamp = round(header_dict["time"], 2)
 
@@ -110,7 +122,7 @@ class NBody6OutputFile(ABC):
                 if timestamp in self._data:
                     warnings.warn(
                         f"{self._filename} - "
-                        f"[LINE {header_data[0]}] timestamp {timestamp} duplicated with "
+                        f"[LINE {header_ln_ref}] timestamp {timestamp} duplicated with "
                         f"[LINE {self._data[timestamp]['_header_line']}]. "
                         "Keeping the last occurrence.",
                         UserWarning,
@@ -119,13 +131,19 @@ class NBody6OutputFile(ABC):
                 self._data[timestamp] = {
                     "header": header_dict,
                     "data": data_df,
-                    "_header_line": header_data[0],
+                    "_header_line": header_ln_ref,
                 }
 
             except Exception as e:
-                raise ValueError(
-                    f"[{self._filename} - LINE {header_data[0]}] {e}"
-                ) from e
+                error_str = str(e)
+                if "LINE" in error_str:
+                    line_info, message = error_str.split(":", 1)
+                    context = f"[{self._filename} - {line_info.strip()}]"
+                else:
+                    context = f"[{self._filename} - LINE {header_ln_ref}]"
+                    message = error_str
+
+                raise ValueError(f"{context} {message.strip()}") from None
 
         # sort the data by timestamp
         self._data = dict(sorted(self._data.items()))
@@ -133,63 +151,75 @@ class NBody6OutputFile(ABC):
         return self._data
 
     def _parse_file(self):
-        header_marker = self._config["header_prefix"]
-        footer_marker = self._config.get("footer_prefix", None)
+        header_prefix = self._config["header_prefix"]
+        header_length = self._config.get("header_length", None)
+        footer_prefix = self._config.get("footer_prefix", None)
 
-        with self._filepath.open("r", encoding="utf-8") as f:
-            groups = groupby(
-                (
-                    (idx + 1, line.strip())
-                    for idx, line in enumerate(f)
-                    if line.strip()
-                    and not (footer_marker and line.strip().startswith(footer_marker))
-                ),
-                lambda line_data: line_data[1].startswith(header_marker),
+        if header_length is None:
+            warnings.warn(
+                f'[{self._filename}] "header_length" not specified. '
+                f"All consecutive lines starting with '{header_prefix}'"
+                "will be treated as a single header block.",
+                UserWarning,
             )
 
-            for is_header, group_iter in groups:
-                # skip non-header lines
-                if not is_header:
-                    continue
+        with self._filepath.open("r", encoding="utf-8") as f:
+            lines = [
+                (idx, txt)
+                for idx, line in enumerate(f, start=1)
+                if (txt := line.strip())
+                and not (footer_prefix and txt.startswith(footer_prefix))
+            ]
 
-                # collect header data first before processing
-                group = list(group_iter)
-                if not group:
-                    continue
+        ln_idx = 0
+        while ln_idx < len(lines):
+            if not lines[ln_idx][1].startswith(header_prefix):
+                ln_idx += 1
+                continue
 
-                # process header lines
-                for ln_num, header_line in group:
-                    if not header_line:
-                        warnings.warn(
-                            f"[{self._filename} - LINE {ln_num}] "
-                            f"Empty header line found in {self._filepath}, "
-                            "possibly malformed file, skipping.",
+            header_block = []
+            start_idx = ln_idx
+            if header_length:
+                if ln_idx + header_length > len(lines):
+                    break
+
+                header_block = lines[ln_idx : ln_idx + header_length]
+                for ln_num, txt in header_block:
+                    if not txt.startswith(header_prefix):
+                        raise ValueError(
+                            f"Expected {header_length} consecutive header lines, "
+                            f'but line {ln_num} does not start with "{header_prefix}".'
                         )
-                        continue
+                ln_idx += header_length
+            else:
+                # Flexible check for variable-length headers
+                while ln_idx < len(lines) and lines[ln_idx][1].startswith(
+                    header_prefix
+                ):
+                    ln_idx += 1
+                header_block = lines[start_idx:ln_idx]
 
-                # collect header tokens for mapping
-                start_ln, stop_ln = group[0][0], group[-1][0]
-                header_tokens = [
-                    token
-                    for _, line in group
-                    for token in line.split(header_marker, 1)[1].split()
-                ]
+            if not header_block:
+                continue
 
-                try:
-                    next_is_header, next_group_iter = next(groups)
-                    row_data = [] if next_is_header else list(next_group_iter)
-                except StopIteration:
-                    row_data = []
+            start_ln, stop_ln = header_block[0][0], header_block[-1][0]
+            ln_ref = f"{start_ln}-{stop_ln}" if start_ln != stop_ln else str(start_ln)
 
-                yield (
-                    (
-                        f"{start_ln}-{stop_ln}"
-                        if start_ln != stop_ln
-                        else str(start_ln),
-                        header_tokens,
-                    ),
-                    [(ln_num, line.split()) for ln_num, line in row_data],
-                )
+            header_tokens = [
+                token
+                for _, txt in header_block
+                for token in txt.lstrip(header_prefix).split()
+            ]
+
+            rows = []
+            while ln_idx < len(lines) and not lines[ln_idx][1].startswith(
+                header_prefix
+            ):
+                row_ln_num, row_txt = lines[ln_idx]
+                rows.append((row_ln_num, row_txt.split()))
+                ln_idx += 1
+
+            yield ((ln_ref, header_tokens), rows)
 
     def _map_tokens(
         self,
@@ -202,28 +232,26 @@ class NBody6OutputFile(ABC):
         mapped_data = {}
         for key, (idx, converter) in schema.items():
             try:
-                if isinstance(idx, int):
-                    value = tokens[idx]
-                else:
-                    value = [tokens[i] for i in idx]
-                mapped_data[key] = converter(value)
+                raw = tokens[idx] if isinstance(idx, int) else [tokens[i] for i in idx]
+                mapped_data[key] = converter(raw)
 
-                # special treatment for `name` keys (`name` / `name1` & `name2`)
-                if key.startswith("name") and mapped_data[key] <= 0:
+                # special handling for 'name' keys
+                if (
+                    key.startswith("name")
+                    and isinstance(mapped_data[key], int)
+                    and mapped_data[key] <= 0
+                ):
                     warnings.warn(
                         f"[{self._filename} - LINE {ln_num}] "
-                        f"Possibly multiple systems '{key}': {mapped_data[key]}. "
+                        f"Possibly multiple system '{key}': {mapped_data[key]}."
                     )
-
             except IndexError:
-                if allow_missing:
-                    mapped_data[key] = None
-                else:
-                    raise ValueError(f"Missing required token '{key}' at index {idx}")
+                if not allow_missing:
+                    raise ValueError(f"Missing value for '{key}'") from None
+                mapped_data[key] = None
             except Exception as e:
-                raise ValueError(e)
+                raise ValueError(f"Cannot process value for '{key}': {e}") from e
 
         if not mapped_data:
-            raise ValueError(f"No valid tokens found in {tokens}")
-
+            raise ValueError("No data mapped from tokens")
         return mapped_data

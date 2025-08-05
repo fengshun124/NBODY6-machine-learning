@@ -10,7 +10,7 @@ class NBody6OUT9(NBody6OutputFile):
             filepath,
             {
                 "header_prefix": "#",
-                "header_ln_num": 3,
+                "header_length": 3,
                 "header_schema": {
                     "time": (1, float),
                     "npairs": (2, int),

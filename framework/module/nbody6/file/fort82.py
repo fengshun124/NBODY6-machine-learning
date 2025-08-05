@@ -11,7 +11,7 @@ class NBody6Fort82(NBody6OutputFile):
             {
                 "header_prefix": "## BEGIN",
                 "footer_prefix": "## END",
-                "header_ln_num": 1,
+                "header_length": 1,
                 "header_schema": {"time": (1, float)},
                 "row_schema": {
                     "name1": (0, int),

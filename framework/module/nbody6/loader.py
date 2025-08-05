@@ -44,17 +44,31 @@ class NBody6OutputLoader:
         }
 
     def __repr__(self):
-        return f"NBody6OutputLoader(root={self._root})"
+        repr_str = f"NBody6OutputLoader(root={self._root}"
+        if self._timestamps:
+            repr_str += (
+                f", raw_timestamps: {len(self._timestamps)} "
+                f"({min(self._timestamps):.2f} Myr - {max(self._timestamps):.2f} Myr)"
+            )
+        if self.timestamps:
+            repr_str += (
+                f", timestamps: {len(self.timestamps)} "
+                f"({min(self.timestamps):.2f} Myr - {max(self.timestamps):.2f} Myr)"
+            )
+        return repr_str + ")"
 
     @property
-    def root(self) -> Path:
-        return self._root
-
-    @property
-    def timestamps(self) -> Optional[List[float]]:
+    def raw_timestamps(self) -> Optional[List[float]]:
         if not self._timestamps:
             warnings.warn("Timestamps are not loaded. Call load() first.")
         return self._timestamps
+
+    @property
+    def timestamps(self) -> Optional[List[float]]:
+        if self._snapshot_dict is None:
+            warnings.warn("Snapshot dictionary is not initialized. Call merge() first.")
+            return None
+        return list(self._snapshot_dict.keys())
 
     @property
     def file_dict(self) -> Dict[str, NBody6OutputFile]:
@@ -79,7 +93,7 @@ class NBody6OutputLoader:
             try:
                 nbody6_file.load(is_strict=is_strict)
             except Exception as e:
-                raise ValueError(f'Error loading "{filename}": {e}') from e
+                raise ValueError(f"Error loading {filename}: {e}") from e
 
         # check if all files share the same timestamps with tolerance of 1e-2
         timestamp_dict = {
@@ -133,8 +147,15 @@ class NBody6OutputLoader:
         if timestamp in self._snapshot_dict:
             return self._snapshot_dict.get(timestamp)
         else:
-            new_timestamp = self._timestamps[
-                np.argmin(np.abs(np.array(self._timestamps) - timestamp))
+            merged_timestamps = self.timestamps
+            if not merged_timestamps:
+                warnings.warn(
+                    "No merged snapshots available to find the closest timestamp."
+                )
+                return None
+
+            new_timestamp = merged_timestamps[
+                np.argmin(np.abs(np.array(merged_timestamps) - timestamp))
             ]
             warnings.warn(
                 f"Timestamp {timestamp} not found in snapshot dictionary. "
@@ -163,6 +184,10 @@ class NBody6OutputLoader:
         self, is_strict: bool = True
     ) -> Dict[float, Dict[str, Union[Dict[str, any], pd.DataFrame]]]:
         self._snapshot_dict = {}
+        if not self._timestamps:
+            warnings.warn("Raw timestamps not loaded. Call load() first.")
+            return self._snapshot_dict
+
         for timestamp in self._timestamps:
             snapshot_data = self._merge(timestamp)
 
