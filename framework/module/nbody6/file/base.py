@@ -81,9 +81,7 @@ class NBody6OutputFile(ABC):
         self._data = {}
 
         for header_data, row_data in self._parse_file():
-            # line number reference for header block
-            header_ln_ref = header_data[0]
-
+            ln_ref = header_data[0]
             try:
                 header_dict = self._map_tokens(
                     ln_data=header_data,
@@ -122,7 +120,7 @@ class NBody6OutputFile(ABC):
                 if timestamp in self._data:
                     warnings.warn(
                         f"{self._filename} - "
-                        f"[LINE {header_ln_ref}] timestamp {timestamp} duplicated with "
+                        f"[LINE {header_data[0]}] timestamp {timestamp} duplicated with "
                         f"[LINE {self._data[timestamp]['_header_line']}]. "
                         "Keeping the last occurrence.",
                         UserWarning,
@@ -131,7 +129,7 @@ class NBody6OutputFile(ABC):
                 self._data[timestamp] = {
                     "header": header_dict,
                     "data": data_df,
-                    "_header_line": header_ln_ref,
+                    "_header_line": ln_ref,
                 }
 
             except Exception as e:
@@ -140,7 +138,7 @@ class NBody6OutputFile(ABC):
                     line_info, message = error_str.split(":", 1)
                     context = f"[{self._filename} - {line_info.strip()}]"
                 else:
-                    context = f"[{self._filename} - LINE {header_ln_ref}]"
+                    context = f"[{self._filename} - LINE {ln_ref}]"
                     message = error_str
 
                 raise ValueError(f"{context} {message.strip()}") from None

@@ -2,11 +2,9 @@ import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import astropy.units as u
 import joblib
 import numpy as np
 import pandas as pd
-from astropy.constants import L_sun, R_sun, sigma_sb
 from matplotlib import pyplot as plt
 
 from module.nbody6.file.base import NBody6OutputFile
@@ -31,6 +29,7 @@ class NBody6OutputLoader:
             Dict[float, Dict[str, Union[Dict[str, any], pd.DataFrame]]]
         ] = None
 
+        self._raw_timestamps: Optional[List[float]] = None
         self._timestamps: Optional[List[float]] = None
 
     def _init_file_dict(self) -> None:
@@ -45,30 +44,30 @@ class NBody6OutputLoader:
 
     def __repr__(self):
         repr_str = f"NBody6OutputLoader(root={self._root}"
+        if self._raw_timestamps:
+            repr_str += (
+                f", raw_timestamps: {len(self._raw_timestamps)} "
+                f"({min(self._raw_timestamps):.2f} Myr - {max(self._raw_timestamps):.2f} Myr)"
+            )
         if self._timestamps:
             repr_str += (
-                f", raw_timestamps: {len(self._timestamps)} "
+                f", timestamps: {len(self._timestamps)} "
                 f"({min(self._timestamps):.2f} Myr - {max(self._timestamps):.2f} Myr)"
-            )
-        if self.timestamps:
-            repr_str += (
-                f", timestamps: {len(self.timestamps)} "
-                f"({min(self.timestamps):.2f} Myr - {max(self.timestamps):.2f} Myr)"
             )
         return repr_str + ")"
 
     @property
     def raw_timestamps(self) -> Optional[List[float]]:
-        if not self._timestamps:
+        if not self._raw_timestamps:
             warnings.warn("Timestamps are not loaded. Call load() first.")
-        return self._timestamps
+        return self._raw_timestamps
 
     @property
     def timestamps(self) -> Optional[List[float]]:
-        if self._snapshot_dict is None:
+        if self._timestamps is None:
             warnings.warn("Snapshot dictionary is not initialized. Call merge() first.")
             return None
-        return list(self._snapshot_dict.keys())
+        return self._timestamps
 
     @property
     def file_dict(self) -> Dict[str, NBody6OutputFile]:
@@ -129,7 +128,7 @@ class NBody6OutputLoader:
                 if ts != ref_ts:
                     nbody6_file.update_timestamp(ts, ref_ts)
 
-        self._timestamps = ref_timestamps
+        self._raw_timestamps = ref_timestamps
         self._is_file_dict_loaded = True
         return self._file_dict
 
@@ -184,11 +183,14 @@ class NBody6OutputLoader:
         self, is_strict: bool = True
     ) -> Dict[float, Dict[str, Union[Dict[str, any], pd.DataFrame]]]:
         self._snapshot_dict = {}
-        if not self._timestamps:
-            warnings.warn("Raw timestamps not loaded. Call load() first.")
+        if not self._raw_timestamps:
+            warnings.warn("Raw data not loaded. Call load() first.")
             return self._snapshot_dict
+        if self._timestamps:
+            warnings.warn("Snapshot dictionary already initialized. Overwriting.")
+            self._timestamps = None
 
-        for timestamp in self._timestamps:
+        for timestamp in self._raw_timestamps:
             snapshot_data = self._merge(timestamp)
 
             # skip if snapshot_data is None (e.g., cluster has dissolved)
@@ -217,6 +219,8 @@ class NBody6OutputLoader:
 
             self._snapshot_dict[timestamp] = snapshot_data
 
+        # construct timestamps from snapshot_dict keys
+        self._timestamps = list(self._snapshot_dict.keys())
         return self._snapshot_dict
 
     def _merge(
@@ -234,13 +238,11 @@ class NBody6OutputLoader:
         if density_center_info["header"]["r_tidal"] < 0:
             warnings.warn(
                 f"Cluster has dissolved at timestamp {timestamp}. "
-                "Skipping snapshot merge."
+                "Terminating merging."
             )
             return None
 
         # calculate distance between stars and density center, in multiple of tidal radius
-        merged_snapshot = out34_snapshot["data"].copy()
-
         cluster_gal_position = (
             out34_snapshot["header"]["rg"] * out34_snapshot["header"]["rbar"]
         )
@@ -248,108 +250,7 @@ class NBody6OutputLoader:
             out34_snapshot["header"]["vg"] * out34_snapshot["header"]["vstar"]
         )
 
-        reg_bin_df = pd.merge(
-            out9_snapshot["data"],
-            fort82_snapshot["data"],
-            on=["name1", "name2"],
-            how="outer",
-            suffixes=("_out9", "_fort82"),
-        )
-
-        # convert from logarithmic to linear scale
-        # L/L_sun = 10^(`log10(L/L_sun)[zlum]`)
-        reg_bin_df["_l1"] = np.power(10, reg_bin_df["zlum1"])
-        reg_bin_df["_l2"] = np.power(10, reg_bin_df["zlum2"])
-        # R/R_sun = 10^(`log10(R/R_sun)[rad]`)
-        reg_bin_df["_r1"] = np.power(10, reg_bin_df["rad1"])
-        reg_bin_df["_r2"] = np.power(10, reg_bin_df["rad2"])
-
-        # effective luminosity
-        # L_eff / L_sun = (L1 + L2) / L_sun = L1/L_sun + L2/L_sun
-        reg_bin_df["L_sol"] = reg_bin_df["_l1"] + reg_bin_df["_l2"]
-        # effective radius
-        # R_eff / R_sun = sqrt(R1^2 + R2^2) / R_sun = sqrt((R1/R_sun)^2 + (R2/R_sun)^2)
-        reg_bin_df["R_sol"] = np.sqrt(
-            np.power(reg_bin_df["_r1"], 2) + np.power(reg_bin_df["_r2"], 2)
-        )
-        # effective temperature
-        # T_eff = (L_eff / (4 * pi * R_eff^2 * sigma_sb))^(1/4)
-        L_eff = reg_bin_df["L_sol"].values * L_sun
-        R_eff = reg_bin_df["R_sol"].values * R_sun
-        reg_bin_df["T_eff"] = (
-            (np.power(L_eff / (4 * np.pi * R_eff**2 * sigma_sb), 1 / 4)).to(u.K).value
-        )
-        reg_bin_df.rename(
-            columns={
-                "L_sol": "L_sol_reg_bin",
-                "R_sol": "R_sol_reg_bin",
-                "T_eff": "T_eff_reg_bin",
-            },
-            inplace=True,
-        )
-
-        single_df = fort83_snapshot["data"].copy()
-        # T_eff = 10^(log10(T_eff))
-        single_df["T_eff_single"] = np.power(10, single_df["tempe"])
-        # L/L_sun = 10^(log10(L/L_sun))
-        single_df["L_sol_single"] = np.power(10, single_df["zlum"])
-        # R/R_sun = 10^(log10(R/R_sun))
-        single_df["R_sol_single"] = np.power(10, single_df["rad"])
-
-        # merge binary into main snapshot
-        merged_snapshot = pd.merge(
-            merged_snapshot,
-            reg_bin_df[["cmName", "T_eff_reg_bin", "L_sol_reg_bin", "R_sol_reg_bin"]],
-            left_on="name",
-            right_on="cmName",
-            how="left",
-        )
-        # merge single stars into main snapshot
-        merged_snapshot = pd.merge(
-            merged_snapshot,
-            single_df[["name", "T_eff_single", "L_sol_single", "R_sol_single"]],
-            on="name",
-            how="left",
-        )
-
-        # flag binary systems
-        merged_snapshot["is_binary"] = merged_snapshot["T_eff_reg_bin"].notna()
-
-        # merge columns
-        merged_snapshot["T_eff"] = merged_snapshot["T_eff_single"].combine_first(
-            merged_snapshot["T_eff_reg_bin"]
-        )
-        merged_snapshot["L_sol"] = merged_snapshot["L_sol_single"].combine_first(
-            merged_snapshot["L_sol_reg_bin"]
-        )
-        merged_snapshot["R_sol"] = merged_snapshot["R_sol_single"].combine_first(
-            merged_snapshot["R_sol_reg_bin"]
-        )
-        # surface flux with respect to solar units
-        # F/F_sun = (L/L_sun) / (R/R_sun)^2
-        merged_snapshot["F_sol"] = (
-            merged_snapshot["L_sol"] / merged_snapshot["R_sol"] ** 2
-        )
-        merged_snapshot["log_T_eff"] = np.log10(merged_snapshot["T_eff"])
-        merged_snapshot["log_L_sol"] = np.log10(merged_snapshot["L_sol"])
-        merged_snapshot["log_R_sol"] = np.log10(merged_snapshot["R_sol"])
-        merged_snapshot["log_F_sol"] = np.log10(merged_snapshot["F_sol"])
-
-        merged_snapshot["r_dc"] = np.linalg.norm(
-            merged_snapshot[["x", "y", "z"]].values
-            - np.array(
-                [
-                    density_center_info["header"]["density_center_x"],
-                    density_center_info["header"]["density_center_y"],
-                    density_center_info["header"]["density_center_z"],
-                ]
-            ),
-            axis=1,
-        )
-        merged_snapshot["r_dc_r_tidal"] = (
-            merged_snapshot["r_dc"] / density_center_info["header"]["r_tidal"]
-        )
-
+        # collect header information
         header_dict = {
             "time": out34_snapshot["header"]["time"],
             "r_tidal": density_center_info["header"]["r_tidal"],
@@ -365,13 +266,115 @@ class NBody6OutputLoader:
             "cluster_mass_center_out34": tuple(
                 map(float, out34_snapshot["header"]["rcm"])
             ),
-            "cluster_gal_positionout_34": cluster_gal_position,
-            "cluster_gal_velocityout_34": cluster_gal_velocity,
+            "cluster_gal_position_out34": cluster_gal_position,
+            "cluster_gal_velocity_out34": cluster_gal_velocity,
         }
+
+        pos_vel_keys = ["x", "y", "z", "vx", "vy", "vz"]
+        attr_keys = ["mass", "zlum", "rad", "tempe"]
+        out34_snapshot_df = out34_snapshot["data"][["name"] + pos_vel_keys]
+
+        # non regularized binaries
+        non_reg_bin_df = (
+            fort19_snapshot["data"]
+            .assign(pair=lambda df: df.index.map(lambda x: f"b{x + 1}"))
+            .melt(
+                id_vars=["pair", "semi"],
+                value_vars=["name1", "name2"],
+                value_name="name",
+            )
+            .loc[:, ["pair", "name", "semi"]]
+            .merge(fort83_snapshot["data"][["name"] + attr_keys], on="name", how="left")
+            .merge(out34_snapshot_df[["name"] + pos_vel_keys], on="name", how="left")
+        )
+
+        # regularized binaries
+        raw_reg_bin_df = (
+            out9_snapshot["data"][["name1", "name2", "semi", "cmName"]]
+            .rename(columns={"cmName": "pair"})
+            .merge(fort82_snapshot["data"], on=["name1", "name2"], how="left")
+        )
+        reg_bin_df = (
+            pd.concat(
+                [
+                    raw_reg_bin_df.assign(
+                        name=lambda df, i=i: df[f"name{i}"],
+                        **{
+                            lbl: (lambda df, lbl=lbl, i=i: df[f"{lbl}{i}"])
+                            for lbl in attr_keys
+                        },
+                    )
+                    for i in (1, 2)
+                ],
+                ignore_index=True,
+            )
+            .loc[:, ["pair", "name", "semi"] + attr_keys]
+            .merge(
+                out34_snapshot_df.rename(columns={"name": "pair"}).loc[
+                    :, ["pair"] + pos_vel_keys
+                ],
+                on="pair",
+                how="left",
+            )
+        )
+
+        # single stars
+        binary_names = set(non_reg_bin_df["name"]) | set(reg_bin_df["name"])
+        singles_df = (
+            fort83_snapshot["data"]
+            .loc[lambda df: ~df["name"].isin(binary_names)]
+            .assign(pair="s", semi=-1)
+            .loc[:, ["pair", "name", "semi"] + attr_keys]
+            .merge(out34_snapshot_df[["name"] + pos_vel_keys], on="name", how="left")
+        )
+
+        merged_df = pd.concat(
+            [reg_bin_df, non_reg_bin_df, singles_df], ignore_index=True
+        )
+        # calculate distance to revised density center from `densCentre.txt`
+        merged_df["r_dc"] = np.linalg.norm(
+            merged_df[["x", "y", "z"]].values
+            - np.array(
+                [
+                    density_center_info["header"]["density_center_x"],
+                    density_center_info["header"]["density_center_y"],
+                    density_center_info["header"]["density_center_z"],
+                ]
+            ),
+            axis=1,
+        )
+        merged_df["r_dc_r_tidal"] = (
+            merged_df["r_dc"] / density_center_info["header"]["r_tidal"]
+        )
+
+        # convert T_eff, L, R, F to log scale
+        merged_df.rename(
+            columns={
+                # effective temperature in Kelvin
+                "tempe": "log_T_eff",
+                # lumonosity in L_sun
+                "zlum": "log_L_sol",
+                # radius in R_sun
+                "rad": "log_R_sol",
+            },
+            inplace=True,
+        )
+        merged_df["T_eff"] = np.power(10, merged_df["log_T_eff"])
+        merged_df["L_sol"] = np.power(10, merged_df["log_L_sol"])
+        merged_df["R_sol"] = np.power(10, merged_df["log_R_sol"])
+        # flux in L_sun / R_sun^2
+        merged_df["F_sol"] = merged_df["L_sol"] / merged_df["R_sol"] ** 2
+        merged_df["log_F_sol"] = np.log10(merged_df["F_sol"])
+
+        # is_binary flag for non-regularized binaries & regularized binaries
+        merged_df["is_binary"] = merged_df["name"].isin(binary_names)
+
+        # skip binaries ID (`name` <= `nzero`) in the merged table
+        merged_df = merged_df[merged_df["name"] <= out34_snapshot["header"]["nzero"]]
 
         return {
             "header": header_dict,
-            "data": merged_snapshot[
+            "data": merged_df[
                 [
                     "name",
                     "x",
@@ -395,6 +398,7 @@ class NBody6OutputLoader:
                 ]
             ],
             "raw": {
+                "densCentre.txt": density_center_info["data"],
                 "OUT34": out34_snapshot["data"],
                 "OUT9": out9_snapshot["data"],
                 "fort.82": fort82_snapshot["data"],
