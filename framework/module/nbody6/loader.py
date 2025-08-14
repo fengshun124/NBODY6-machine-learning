@@ -1,4 +1,5 @@
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -6,8 +7,10 @@ import joblib
 import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
+from tqdm.auto import tqdm
 
-from module.nbody6.file.base import NBody6OutputFile
+from module.nbody6.calc.binary import calc_semi_major_axis
+from module.nbody6.file.base import NBody6FileParserBase, NBody6FileSnapshot
 from module.nbody6.file.fort19 import NBody6Fort19
 from module.nbody6.file.fort82 import NBody6Fort82
 from module.nbody6.file.fort83 import NBody6Fort83
@@ -17,18 +20,26 @@ from module.nbody6.file.out34 import NBody6OUT34
 from module.nbody6.plot.animate import animate_nbody6_snapshots
 
 
+@dataclass
+class NBody6Snapshot:
+    header: Dict[str, Any]
+    data: pd.DataFrame
+    binary_pair: pd.DataFrame
+    raw_snapshot_dict: Dict[str, NBody6FileSnapshot]
+
+    def __repr__(self):
+        return (
+            f"{__class__.__name__}({self.header['time']:.2f} Myr, n={len(self.data)})"
+        )
+
+
 class NBody6OutputLoader:
     def __init__(self, root: Union[str, Path]) -> None:
         self._root = Path(root).resolve()
-
-        self._file_dict: Dict[str, NBody6OutputFile] = {}
+        self._file_dict: Dict[str, NBody6FileParserBase] = {}
         self._init_file_dict()
         self._is_file_dict_loaded = False
-
-        self._snapshot_dict: Optional[
-            Dict[float, Dict[str, Union[Dict[str, any], pd.DataFrame]]]
-        ] = None
-
+        self._snapshot_dict: Optional[Dict[float, NBody6Snapshot]] = None
         self._raw_timestamps: Optional[List[float]] = None
         self._timestamps: Optional[List[float]] = None
 
@@ -70,12 +81,12 @@ class NBody6OutputLoader:
         return self._timestamps
 
     @property
-    def file_dict(self) -> Dict[str, NBody6OutputFile]:
+    def file_dict(self) -> Dict[str, NBody6FileParserBase]:
         if not self._file_dict:
             warnings.warn("File dictionary is empty. Call load() first.")
         return self._file_dict
 
-    def load(self, is_strict: bool = True) -> Dict[str, NBody6OutputFile]:
+    def load(self, is_strict: bool = True) -> Dict[str, NBody6FileParserBase]:
         # check if files are already loaded. If so, reset them.
         if self._is_file_dict_loaded:
             warnings.warn(
@@ -132,17 +143,13 @@ class NBody6OutputLoader:
         self._is_file_dict_loaded = True
         return self._file_dict
 
-    def get_snapshot(
-        self, timestamp: float
-    ) -> Optional[Dict[str, Union[Dict[str, any], pd.DataFrame]]]:
+    def get_snapshot(self, timestamp: float) -> Optional[NBody6FileSnapshot]:
         if not self._is_file_dict_loaded:
             warnings.warn("File dictionary is not loaded. Call load() first.")
             return None
-
         if self._snapshot_dict is None:
             warnings.warn("Snapshot dictionary is not initialized. Call merge() first.")
             return None
-
         if timestamp in self._snapshot_dict:
             return self._snapshot_dict.get(timestamp)
         else:
@@ -152,7 +159,6 @@ class NBody6OutputLoader:
                     "No merged snapshots available to find the closest timestamp."
                 )
                 return None
-
             new_timestamp = merged_timestamps[
                 np.argmin(np.abs(np.array(merged_timestamps) - timestamp))
             ]
@@ -163,9 +169,7 @@ class NBody6OutputLoader:
             return self._snapshot_dict.get(new_timestamp)
 
     @property
-    def snapshot_dict(
-        self,
-    ) -> Optional[Dict[float, Dict[str, Union[Dict[str, any], pd.DataFrame]]]]:
+    def snapshot_dict(self) -> Optional[Dict[float, NBody6FileSnapshot]]:
         if self._snapshot_dict is None:
             warnings.warn("Snapshot dictionary is not initialized. Call merge() first.")
             return None
@@ -174,14 +178,12 @@ class NBody6OutputLoader:
         return self._snapshot_dict
 
     @property
-    def snapshot_list(
-        self,
-    ) -> Optional[List[Tuple[float, Dict[str, Union[Dict[str, any], pd.DataFrame]]]]]:
+    def snapshot_list(self) -> Optional[List[Tuple[float, NBody6FileSnapshot]]]:
         return list(self.snapshot_dict.items()) if self.snapshot_dict else None
 
     def merge(
-        self, is_strict: bool = True
-    ) -> Dict[float, Dict[str, Union[Dict[str, any], pd.DataFrame]]]:
+        self, is_strict: bool = True, is_verbose: bool = True
+    ) -> Dict[float, NBody6FileSnapshot]:
         self._snapshot_dict = {}
         if not self._raw_timestamps:
             warnings.warn("Raw data not loaded. Call load() first.")
@@ -190,81 +192,90 @@ class NBody6OutputLoader:
             warnings.warn("Snapshot dictionary already initialized. Overwriting.")
             self._timestamps = None
 
-        for timestamp in self._raw_timestamps:
-            snapshot_data = self._merge(timestamp)
-
-            # skip if snapshot_data is None (e.g., cluster has dissolved)
-            if snapshot_data is None:
+        for timestamp in (
+            pbar := tqdm(self._raw_timestamps, leave=False)
+            if is_verbose
+            else self._raw_timestamps
+        ):
+            snapshot = self._merge(timestamp)
+            if snapshot is None:
                 break
 
-            # check if snapshot_df contains NaN values
-            snapshot_df = snapshot_data["data"]
-            if snapshot_df.isnull().values.any():
-                nan_rows = snapshot_df[snapshot_df.isnull().any(axis=1)]
-                nan_names = nan_rows["name"].tolist()
+            if is_verbose:
+                pbar.set_description(f"Merging Snapshot@{timestamp:.2f} Myr")
 
-                msg_text = (
-                    f"Snapshot at {timestamp} contains NaN values. "
-                    "Possibly due to misaligned `name` values across files. "
-                    f"Names with NaN values: {nan_names}. "
-                )
-
-                if is_strict:
-                    raise ValueError(
-                        msg_text + "\nSet `is_strict=False` to ignore this check."
+            # validation
+            for snapshot_data, data_label in [
+                (snapshot.data, "Snapshot"),
+                (snapshot.binary_pair, "Binary Pairing"),
+            ]:
+                if snapshot_data.isnull().values.any():
+                    nan_rows = snapshot_data[snapshot_data.isnull().any(axis=1)]
+                    id_col = "name" if data_label == "Snapshot" else "pair"
+                    nan_ids = nan_rows[id_col].tolist()
+                    msg_text = (
+                        f"{data_label} at {timestamp} contains NaN values. "
+                        "Possibly due to misaligned `name` values across files. "
+                        f"IDs with NaN values: {nan_ids}. "
                     )
-                else:
-                    warnings.warn(msg_text + "\nRows with NaN values will be dropped.")
-                    snapshot_data["data"] = snapshot_df.dropna()
+                    if is_strict:
+                        raise ValueError(
+                            msg_text + "\nSet `is_strict=False` to ignore this check."
+                        )
+                    else:
+                        warnings.warn(
+                            msg_text + "\nRows with NaN values will be dropped."
+                        )
+                        snapshot_data = snapshot_data.dropna()
+            self._snapshot_dict[timestamp] = snapshot
 
-            self._snapshot_dict[timestamp] = snapshot_data
+        if not self._snapshot_dict:
+            warnings.warn(
+                "No valid snapshots found. Check if the input files are correct."
+            )
 
-        # construct timestamps from snapshot_dict keys
         self._timestamps = list(self._snapshot_dict.keys())
         return self._snapshot_dict
 
-    def _merge(
-        self, timestamp: float
-    ) -> Dict[str, Union[Dict[str, Any], pd.DataFrame, Dict[str, NBody6OutputFile]]]:
+    def _merge(self, timestamp: float) -> NBody6FileSnapshot:
         # extract snapshots with header and data from corresponding timestamp
         out34_snapshot = self._file_dict["OUT34"][timestamp]
         out9_snapshot = self._file_dict["OUT9"][timestamp]
         fort19_snapshot = self._file_dict["fort.19"][timestamp]
         fort82_snapshot = self._file_dict["fort.82"][timestamp]
         fort83_snapshot = self._file_dict["fort.83"][timestamp]
-        density_center_info = self._file_dict["densCentre.txt"][timestamp]
+        density_info_snapshot = self._file_dict["densCentre.txt"][timestamp]
 
         # skip if cluster has dissolved
-        if density_center_info["header"]["r_tidal"] < 0:
+        if density_info_snapshot.header["r_tidal"] < 0:
             warnings.warn(
-                f"Cluster has dissolved at timestamp {timestamp}. "
-                "Terminating merging."
+                f"Cluster has dissolved at timestamp {timestamp}. Terminating merging."
             )
             return None
 
         # calculate distance between stars and density center, in multiple of tidal radius
         cluster_gal_position = (
-            out34_snapshot["header"]["rg"] * out34_snapshot["header"]["rbar"]
+            out34_snapshot.header["rg"] * out34_snapshot.header["rbar"]
         )
         cluster_gal_velocity = (
-            out34_snapshot["header"]["vg"] * out34_snapshot["header"]["vstar"]
+            out34_snapshot.header["vg"] * out34_snapshot.header["vstar"]
         )
 
         # collect header information
         header_dict = {
-            "time": out34_snapshot["header"]["time"],
-            "r_tidal": density_center_info["header"]["r_tidal"],
+            "time": out34_snapshot.header["time"],
+            "r_tidal": density_info_snapshot.header["r_tidal"],
             "cluster_density_center": (
-                density_center_info["header"]["density_center_x"],
-                density_center_info["header"]["density_center_y"],
-                density_center_info["header"]["density_center_z"],
+                density_info_snapshot.header["density_center_x"],
+                density_info_snapshot.header["density_center_y"],
+                density_info_snapshot.header["density_center_z"],
             ),
-            "r_tidal_out34": out34_snapshot["header"]["rtide"],
+            "r_tidal_out34": out34_snapshot.header["rtide"],
             "cluster_density_center_out34": tuple(
-                map(float, out34_snapshot["header"]["rd"])
+                map(float, out34_snapshot.header["rd"])
             ),
             "cluster_mass_center_out34": tuple(
-                map(float, out34_snapshot["header"]["rcm"])
+                map(float, out34_snapshot.header["rcm"])
             ),
             "cluster_gal_position_out34": cluster_gal_position,
             "cluster_gal_velocity_out34": cluster_gal_velocity,
@@ -272,83 +283,175 @@ class NBody6OutputLoader:
 
         pos_vel_keys = ["x", "y", "z", "vx", "vy", "vz"]
         attr_keys = ["mass", "zlum", "rad", "tempe"]
-        out34_snapshot_df = out34_snapshot["data"][["name"] + pos_vel_keys]
+        density_center_dist_keys = ["r_dc", "r_dc_r_tidal"]
 
-        # non regularized binaries
-        non_reg_bin_df = (
-            fort19_snapshot["data"]
-            .assign(pair=lambda df: df.index.map(lambda x: f"b{x + 1}"))
-            .melt(
-                id_vars=["pair", "semi"],
-                value_vars=["name1", "name2"],
-                value_name="name",
-            )
-            .loc[:, ["pair", "name", "semi"]]
-            .merge(fort83_snapshot["data"][["name"] + attr_keys], on="name", how="left")
-            .merge(out34_snapshot_df[["name"] + pos_vel_keys], on="name", how="left")
-        )
-
-        # regularized binaries
-        raw_reg_bin_df = (
-            out9_snapshot["data"][["name1", "name2", "semi", "cmName"]]
-            .rename(columns={"cmName": "pair"})
-            .merge(fort82_snapshot["data"], on=["name1", "name2"], how="left")
-        )
-        reg_bin_df = (
-            pd.concat(
-                [
-                    raw_reg_bin_df.assign(
-                        name=lambda df, i=i: df[f"name{i}"],
-                        **{
-                            lbl: (lambda df, lbl=lbl, i=i: df[f"{lbl}{i}"])
-                            for lbl in attr_keys
-                        },
-                    )
-                    for i in (1, 2)
-                ],
-                ignore_index=True,
-            )
-            .loc[:, ["pair", "name", "semi"] + attr_keys]
-            .merge(
-                out34_snapshot_df.rename(columns={"name": "pair"}).loc[
-                    :, ["pair"] + pos_vel_keys
-                ],
-                on="pair",
-                how="left",
-            )
-        )
-
-        # single stars
-        binary_names = set(non_reg_bin_df["name"]) | set(reg_bin_df["name"])
-        singles_df = (
-            fort83_snapshot["data"]
-            .loc[lambda df: ~df["name"].isin(binary_names)]
-            .assign(pair="s", semi=-1)
-            .loc[:, ["pair", "name", "semi"] + attr_keys]
-            .merge(out34_snapshot_df[["name"] + pos_vel_keys], on="name", how="left")
-        )
-
-        merged_df = pd.concat(
-            [reg_bin_df, non_reg_bin_df, singles_df], ignore_index=True
-        )
-        # calculate distance to revised density center from `densCentre.txt`
-        merged_df["r_dc"] = np.linalg.norm(
-            merged_df[["x", "y", "z"]].values
+        # calculate distance to the revised density center from `densCentre.txt`
+        atomic_pos_vel_df = out34_snapshot.data.copy()[["name"] + pos_vel_keys]
+        atomic_pos_vel_df["r_dc"] = np.linalg.norm(
+            atomic_pos_vel_df[["x", "y", "z"]].values
             - np.array(
                 [
-                    density_center_info["header"]["density_center_x"],
-                    density_center_info["header"]["density_center_y"],
-                    density_center_info["header"]["density_center_z"],
+                    density_info_snapshot.header["density_center_x"],
+                    density_info_snapshot.header["density_center_y"],
+                    density_info_snapshot.header["density_center_z"],
                 ]
             ),
             axis=1,
         )
-        merged_df["r_dc_r_tidal"] = (
-            merged_df["r_dc"] / density_center_info["header"]["r_tidal"]
+        atomic_pos_vel_df["r_dc_r_tidal"] = (
+            atomic_pos_vel_df["r_dc"] / density_info_snapshot.header["r_tidal"]
+        )
+
+        # collect attributes from fort.82 (regularized bin.) and fort.83 (single + non-reg. bin.)
+        attr_df = (
+            pd.concat(
+                [
+                    pd.concat(
+                        [
+                            fort82_snapshot.data.copy().rename(
+                                columns={
+                                    f"{attr}{i}": attr for attr in ["name"] + attr_keys
+                                }
+                            )[["name", *attr_keys]]
+                            for i in (1, 2)
+                        ],
+                        ignore_index=True,
+                    ).drop_duplicates(subset=["name"]),
+                    fort83_snapshot.data.copy()[["name"] + attr_keys],
+                ]
+            )
+            .drop_duplicates(subset=["name"])
+            .reset_index(drop=True)
+        )
+
+        # map regularized binaries from OUT9
+        reg_bin_map = (
+            out9_snapshot.data.copy()
+            .melt(id_vars=["cmName"], value_vars=["name1", "name2"], value_name="name")
+            .drop(columns="variable")
+            .groupby("cmName")["name"]
+            .apply(list)
+            .to_dict()
+        )
+
+        # extend pos / vel for regularized binaries
+        pos_vel_df = pd.DataFrame(
+            [
+                i
+                for s in atomic_pos_vel_df.copy().apply(
+                    lambda r: (
+                        [(r["name"], *r[pos_vel_keys + density_center_dist_keys])]
+                        if (
+                            r["name"] <= out34_snapshot.header["nzero"]
+                            or r["name"] not in reg_bin_map
+                        )
+                        else [
+                            (n, *r[pos_vel_keys + density_center_dist_keys])
+                            for n in reg_bin_map[r["name"]]
+                        ]
+                    ),
+                    axis=1,
+                )
+                for i in s
+            ],
+            columns=["name"] + pos_vel_keys + density_center_dist_keys,
+        ).astype({"name": int})
+
+        # merge attributes and positions / velocities
+        main_df = pd.merge(attr_df, pos_vel_df, on="name", how="left").reset_index(
+            drop=True
+        )
+
+        # construct binary pairs and calculate semi-major axis
+        reg_bin_pair_df = (
+            out9_snapshot.data.copy()[
+                ["name1", "name2", "mass1", "mass2", "ecc", "p", "cmName"]
+            ]
+            .rename(columns={"cmName": "pair"})
+            .assign(
+                semi=lambda df: df.apply(
+                    lambda r: calc_semi_major_axis(
+                        m1=r["mass1"],
+                        m2=r["mass2"],
+                        period_days=np.power(10, r["p"]),
+                    ),
+                    axis=1,
+                ),
+            )
+        )
+
+        f19_df = fort19_snapshot.data.copy()[
+            ["name1", "name2", "mass1", "mass2", "ecc", "p"]
+        ]
+        non_reg_bin_pair_df = f19_df.assign(
+            pair=lambda df: df.apply(
+                lambda r: f"b-{int(r['name1'])}-{int(r['name2'])}"
+                if r["mass1"] >= r["mass2"]
+                else f"b-{int(r['name2'])}-{int(r['name1'])}",
+                axis=1,
+            ),
+            semi=lambda df: df.apply(
+                lambda r: calc_semi_major_axis(
+                    m1=r["mass1"], m2=r["mass2"], period_days=np.power(10, r["p"])
+                ),
+                axis=1,
+            ),
+        )
+
+        mass_map = attr_df.set_index("name")["mass"].to_dict()
+
+        def _extend_id(n):
+            return (
+                [int(n)]
+                if (
+                    int(n) <= out34_snapshot.header["nzero"]
+                    and int(n) not in reg_bin_map
+                )
+                else [
+                    int(x)
+                    for x in reg_bin_map.get(int(n), [int(n)])
+                    if int(x) <= out34_snapshot.header["nzero"]
+                ]
+            )
+
+        # construct binary pairs DataFrame for both regularized and non-regularized binaries
+        pair_df = (
+            pd.concat(
+                [reg_bin_pair_df, non_reg_bin_pair_df],
+                ignore_index=True,
+            )
+            .drop_duplicates(subset=["pair"])
+            .reset_index(drop=True)
+        )
+        # drop whose name1 / name2 NOT in main_df or cmName
+        pair_df = pair_df[
+            pair_df["name1"].isin(main_df["name"])
+            & pair_df["name2"].isin(main_df["name"])
+            & pair_df["pair"].isin(out9_snapshot.data["cmName"])
+        ].copy()
+        # extend obj1_ids and obj2_ids for regularized binaries
+        # and calculate information for obj1 and obj2
+        pair_df = (
+            pair_df.assign(
+                obj1_ids=pair_df["name1"].map(_extend_id),
+                obj2_ids=pair_df["name2"].map(_extend_id),
+            )
+            .assign(
+                obj1_mass=lambda df: df["obj1_ids"].map(
+                    lambda ids: [mass_map.get(i) for i in ids]
+                ),
+                obj2_mass=lambda df: df["obj2_ids"].map(
+                    lambda ids: [mass_map.get(i) for i in ids]
+                ),
+            )
+            .assign(
+                obj1_total_mass=lambda df: df["obj1_mass"].map(sum),
+                obj2_total_mass=lambda df: df["obj2_mass"].map(sum),
+            )
         )
 
         # convert T_eff, L, R, F to log scale
-        merged_df.rename(
+        main_df.rename(
             columns={
                 # effective temperature in Kelvin
                 "tempe": "log_T_eff",
@@ -359,22 +462,25 @@ class NBody6OutputLoader:
             },
             inplace=True,
         )
-        merged_df["T_eff"] = np.power(10, merged_df["log_T_eff"])
-        merged_df["L_sol"] = np.power(10, merged_df["log_L_sol"])
-        merged_df["R_sol"] = np.power(10, merged_df["log_R_sol"])
+        main_df["T_eff"] = np.power(10, main_df["log_T_eff"])
+        main_df["L_sol"] = np.power(10, main_df["log_L_sol"])
+        main_df["R_sol"] = np.power(10, main_df["log_R_sol"])
         # flux in L_sun / R_sun^2
-        merged_df["F_sol"] = merged_df["L_sol"] / merged_df["R_sol"] ** 2
-        merged_df["log_F_sol"] = np.log10(merged_df["F_sol"])
+        main_df["F_sol"] = main_df["L_sol"] / main_df["R_sol"] ** 2
+        main_df["log_F_sol"] = np.log10(main_df["F_sol"])
 
         # is_binary flag for non-regularized binaries & regularized binaries
-        merged_df["is_binary"] = merged_df["name"].isin(binary_names)
+        binary_names = set(
+            fort82_snapshot.data[["name1", "name2"]].values.flatten()
+        ) | set(fort19_snapshot.data[["name1", "name2"]].values.flatten())
+        main_df["is_binary"] = main_df["name"].isin(binary_names)
 
         # skip binaries ID (`name` <= `nzero`) in the merged table
-        merged_df = merged_df[merged_df["name"] <= out34_snapshot["header"]["nzero"]]
+        main_df = main_df[main_df["name"] <= out34_snapshot.header["nzero"]]
 
-        return {
-            "header": header_dict,
-            "data": merged_df[
+        return NBody6Snapshot(
+            header=header_dict,
+            data=main_df.sort_values(by="name").reset_index(drop=True)[
                 [
                     "name",
                     "x",
@@ -387,9 +493,6 @@ class NBody6OutputLoader:
                     "r_dc",
                     "r_dc_r_tidal",
                     "T_eff",
-                    "L_sol",
-                    "R_sol",
-                    "F_sol",
                     "log_T_eff",
                     "log_L_sol",
                     "log_R_sol",
@@ -397,15 +500,28 @@ class NBody6OutputLoader:
                     "is_binary",
                 ]
             ],
-            "raw": {
-                "densCentre.txt": density_center_info["data"],
-                "OUT34": out34_snapshot["data"],
-                "OUT9": out9_snapshot["data"],
-                "fort.82": fort82_snapshot["data"],
-                "fort.83": fort83_snapshot["data"],
-                "fort.19": fort19_snapshot["data"],
+            binary_pair=pair_df.sort_values(by="name1").reset_index(drop=True)[
+                [
+                    "obj1_ids",
+                    "obj2_ids",
+                    "obj1_total_mass",
+                    "obj2_total_mass",
+                    "obj1_mass",
+                    "obj2_mass",
+                    "pair",
+                    "semi",
+                    "ecc",
+                ]
+            ],
+            raw_snapshot_dict={
+                "densCentre.txt": density_info_snapshot,
+                "OUT34": out34_snapshot,
+                "OUT9": out9_snapshot,
+                "fort.82": fort82_snapshot,
+                "fort.83": fort83_snapshot,
+                "fort.19": fort19_snapshot,
             },
-        }
+        )
 
     def export_snapshot_dict(
         self, output_path: Union[str, Path], overwrite: bool = False
@@ -414,13 +530,11 @@ class NBody6OutputLoader:
             raise ValueError(
                 "Snapshot dictionary is not initialized. Call merge() first."
             )
-
         output_path = Path(output_path).resolve()
         if output_path.exists() and not overwrite:
             raise FileExistsError(
                 f"File `{output_path}` already exists. Use overwrite=True to force overwrite."
             )
-
         joblib.dump(self._snapshot_dict, output_path)
         print(f"Snapshot dictionary exported to `{output_path}`.")
 
@@ -434,7 +548,6 @@ class NBody6OutputLoader:
         snapshot_list = self.snapshot_list
         if not snapshot_list:
             raise ValueError("No snapshots available to animate.")
-
         animation = animate_nbody6_snapshots(
             snapshot_list=snapshot_list,
             output_path=output_path,
@@ -442,13 +555,11 @@ class NBody6OutputLoader:
             animation_fps=animation_fps,
             animation_dpi=animation_dpi,
         )
-
         if not output_path:
             plt.show()
-
         return animation
 
-    def get_statistics(self) -> Optional[pd.DataFrame]:
+    def get_statistics(self, is_verbose: bool = False) -> Optional[pd.DataFrame]:
         def _describe_stats(
             data_df: pd.DataFrame, key: str, prefix: Optional[str] = None
         ) -> Dict[str, Any]:
@@ -468,9 +579,16 @@ class NBody6OutputLoader:
             return None
 
         simulation_stats = []
-        for timestamp, snapshot_data in self._snapshot_dict.items():
-            header = snapshot_data["header"]
-            snapshot_df = snapshot_data["data"]
+        for timestamp, snapshot in (
+            pbar := tqdm(self._snapshot_dict.items(), leave=False)
+            if is_verbose
+            else self._snapshot_dict.items()
+        ):
+            if is_verbose:
+                pbar.set_description(f"Processing Snapshot@{timestamp:.2f} Myr")
+
+            header = snapshot.header
+            snapshot_df = snapshot.data
 
             snapshot_within_r_tidal_df = snapshot_df[snapshot_df["r_dc_r_tidal"] < 1]
             snapshot_within_2x_r_tidal_df = snapshot_df[snapshot_df["r_dc_r_tidal"] < 2]

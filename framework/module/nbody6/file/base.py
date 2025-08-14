@@ -1,12 +1,26 @@
 import warnings
 from abc import ABC
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 
 
-class NBody6OutputFile(ABC):
+@dataclass
+class NBody6FileSnapshot:
+    header: Dict[str, Any]
+    data: pd.DataFrame
+    header_ln_ref: str
+
+    def __repr__(self):
+        return (
+            f"{__class__.__name__}"
+            f"(header={self.header}, data_shape={self.data.shape}, header_ln_ref='{self.header_ln_ref}')"
+        )
+
+
+class NBody6FileParserBase(ABC):
     def __init__(self, filepath: Union[str, Path], load_config: Dict[str, Any]) -> None:
         self._filepath = Path(filepath).resolve()
         if not self._filepath.is_file():
@@ -14,9 +28,7 @@ class NBody6OutputFile(ABC):
 
         self._filename = str(self._filepath)
         self._config = load_config
-        self._data: Optional[
-            Dict[float, Dict[str, Union[Dict[str, Any], pd.DataFrame]]]
-        ] = None
+        self._data: Optional[Dict[float, NBody6FileSnapshot]] = None
 
     def __repr__(self):
         return f"{__class__.__name__}({self._filepath})"
@@ -26,17 +38,13 @@ class NBody6OutputFile(ABC):
             return len(self._data)
         return -1
 
-    def __getitem__(
-        self, timestamp: float
-    ) -> Dict[str, Union[Dict[str, Any], pd.DataFrame]]:
+    def __getitem__(self, timestamp: float) -> NBody6FileSnapshot:
         if self._data is None:
             raise ValueError("Data not loaded. Please call load() first.")
         if timestamp not in self._data:
             raise KeyError(f"Timestamp {timestamp} not found in data.")
 
-        data_dict = self._data[timestamp].copy()
-        data_dict.pop("_header_line", None)
-        return data_dict
+        return self._data[timestamp]
 
     @property
     def timestamps(self) -> List[float]:
@@ -56,20 +64,13 @@ class NBody6OutputFile(ABC):
         self._data[new_timestamp] = self._data.pop(old_timestamp)
 
     @property
-    def data_dict(
-        self,
-    ) -> Optional[Dict[float, Dict[str, Union[Dict[str, Any], pd.DataFrame]]]]:
+    def data_dict(self) -> Optional[Dict[float, NBody6FileSnapshot]]:
         if self._data is None:
             warnings.warn("Data not loaded. Please call load() first.", UserWarning)
-        return {
-            timestamp: {k: v for k, v in data.items() if not k.startswith("_")}
-            for timestamp, data in self._data.items()
-        }
+        return self._data
 
     @property
-    def data_list(
-        self,
-    ) -> Optional[List[Tuple[float, Dict[str, Union[Dict[str, Any], pd.DataFrame]]]]]:
+    def data_list(self) -> Optional[List[Tuple[float, NBody6FileSnapshot]]]:
         return list(self.data_dict.items()) if self.data_dict else None
 
     def load(self, is_strict: bool = True):
@@ -81,7 +82,7 @@ class NBody6OutputFile(ABC):
         self._data = {}
 
         for header_data, row_data in self._parse_file():
-            ln_ref = header_data[0]
+            header_ln_ref = header_data[0]
             try:
                 header_dict = self._map_tokens(
                     ln_data=header_data,
@@ -116,21 +117,18 @@ class NBody6OutputFile(ABC):
 
                 timestamp = round(header_dict["time"], 2)
 
-                # warning if timestamp already exists
                 if timestamp in self._data:
                     warnings.warn(
                         f"{self._filename} - "
-                        f"[LINE {header_data[0]}] timestamp {timestamp} duplicated with "
-                        f"[LINE {self._data[timestamp]['_header_line']}]. "
+                        f"[LINE {header_ln_ref}] timestamp {timestamp} duplicated with "
+                        f"[LINE {self._data[timestamp].header_ln_ref}]. "
                         "Keeping the last occurrence.",
                         UserWarning,
                     )
 
-                self._data[timestamp] = {
-                    "header": header_dict,
-                    "data": data_df,
-                    "_header_line": ln_ref,
-                }
+                self._data[timestamp] = NBody6FileSnapshot(
+                    header=header_dict, data=data_df, header_ln_ref=header_ln_ref
+                )
 
             except Exception as e:
                 error_str = str(e)
@@ -138,13 +136,14 @@ class NBody6OutputFile(ABC):
                     line_info, message = error_str.split(":", 1)
                     context = f"[{self._filename} - {line_info.strip()}]"
                 else:
-                    context = f"[{self._filename} - LINE {ln_ref}]"
+                    context = f"[{self._filename} - LINE {header_ln_ref}]"
                     message = error_str
 
                 raise ValueError(f"{context} {message.strip()}") from None
 
-        # sort the data by timestamp
-        self._data = dict(sorted(self._data.items()))
+        if self._data:
+            sorted_timestamps = sorted(self._data.keys())
+            self._data = {ts: self._data[ts] for ts in sorted_timestamps}
 
         return self._data
 
@@ -190,7 +189,6 @@ class NBody6OutputFile(ABC):
                         )
                 ln_idx += header_length
             else:
-                # Flexible check for variable-length headers
                 while ln_idx < len(lines) and lines[ln_idx][1].startswith(
                     header_prefix
                 ):
