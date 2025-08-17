@@ -361,95 +361,8 @@ class NBody6OutputLoader:
         main_df = pd.merge(attr_df, pos_vel_df, on="name", how="left").reset_index(
             drop=True
         )
-
-        # construct binary pairs and calculate semi-major axis
-        reg_bin_pair_df = (
-            out9_snapshot.data.copy()[
-                ["name1", "name2", "mass1", "mass2", "ecc", "p", "cmName"]
-            ]
-            .rename(columns={"cmName": "pair"})
-            .assign(
-                semi=lambda df: df.apply(
-                    lambda r: calc_semi_major_axis(
-                        m1=r["mass1"],
-                        m2=r["mass2"],
-                        period_days=np.power(10, r["p"]),
-                    ),
-                    axis=1,
-                ),
-            )
-        )
-
-        f19_df = fort19_snapshot.data.copy()[
-            ["name1", "name2", "mass1", "mass2", "ecc", "p"]
-        ]
-        non_reg_bin_pair_df = f19_df.assign(
-            pair=lambda df: df.apply(
-                lambda r: f"b-{int(r['name1'])}-{int(r['name2'])}"
-                if r["mass1"] >= r["mass2"]
-                else f"b-{int(r['name2'])}-{int(r['name1'])}",
-                axis=1,
-            ),
-            semi=lambda df: df.apply(
-                lambda r: calc_semi_major_axis(
-                    m1=r["mass1"], m2=r["mass2"], period_days=np.power(10, r["p"])
-                ),
-                axis=1,
-            ),
-        )
-
-        mass_map = attr_df.set_index("name")["mass"].to_dict()
-
-        def _extend_id(n):
-            return (
-                [int(n)]
-                if (
-                    int(n) <= out34_snapshot.header["nzero"]
-                    and int(n) not in reg_bin_map
-                )
-                else [
-                    int(x)
-                    for x in reg_bin_map.get(int(n), [int(n)])
-                    if int(x) <= out34_snapshot.header["nzero"]
-                ]
-            )
-
-        # construct binary pairs DataFrame for both regularized and non-regularized binaries
-        pair_df = (
-            pd.concat(
-                [reg_bin_pair_df, non_reg_bin_pair_df],
-                ignore_index=True,
-            )
-            .drop_duplicates(subset=["pair"])
-            .reset_index(drop=True)
-        )
-        # drop whose name1 / name2 NOT in main_df or cmName
-        pair_df = pair_df[
-            pair_df["name1"].isin(main_df["name"])
-            & pair_df["name2"].isin(main_df["name"])
-            & pair_df["pair"].isin(out9_snapshot.data["cmName"])
-        ].copy()
-        # extend obj1_ids and obj2_ids for regularized binaries
-        # and calculate information for obj1 and obj2
-        pair_df = (
-            pair_df.assign(
-                obj1_ids=pair_df["name1"].map(_extend_id),
-                obj2_ids=pair_df["name2"].map(_extend_id),
-            )
-            .assign(
-                obj1_mass=lambda df: df["obj1_ids"].map(
-                    lambda ids: [mass_map.get(i) for i in ids]
-                ),
-                obj2_mass=lambda df: df["obj2_ids"].map(
-                    lambda ids: [mass_map.get(i) for i in ids]
-                ),
-            )
-            .assign(
-                obj1_total_mass=lambda df: df["obj1_mass"].map(sum),
-                obj2_total_mass=lambda df: df["obj2_mass"].map(sum),
-            )
-        )
-
+        # skip binaries ID (`name` <= `nzero`) in the merged table
+        main_df = main_df[main_df["name"] <= out34_snapshot.header["nzero"]]
         # convert T_eff, L, R, F to log scale
         main_df.rename(
             columns={
@@ -475,8 +388,123 @@ class NBody6OutputLoader:
         ) | set(fort19_snapshot.data[["name1", "name2"]].values.flatten())
         main_df["is_binary"] = main_df["name"].isin(binary_names)
 
-        # skip binaries ID (`name` <= `nzero`) in the merged table
-        main_df = main_df[main_df["name"] <= out34_snapshot.header["nzero"]]
+        # construct binary pairs and calculate semi-major axis
+        reg_bin_pair_df = (
+            out9_snapshot.data.copy()[
+                ["name1", "name2", "mass1", "mass2", "ecc", "p", "cmName"]
+            ]
+            .rename(columns={"cmName": "pair"})
+            .assign(
+                semi=lambda df: df.apply(
+                    lambda r: calc_semi_major_axis(
+                        m1=r["mass1"],
+                        m2=r["mass2"],
+                        period_days=np.power(10, r["p"]),
+                    ),
+                    axis=1,
+                ),
+            )
+        )
+        f19_df = (
+            fort19_snapshot.data.copy()[
+                ["name1", "name2", "mass1", "mass2", "ecc", "p"]
+            ]
+            if not fort19_snapshot.data.empty
+            else pd.DataFrame(columns=["name1", "name2", "mass1", "mass2", "ecc", "p"])
+        )
+        non_reg_bin_pair_df = (
+            f19_df.assign(
+                pair=lambda df: df.apply(
+                    lambda r: f"b-{int(r['name1'])}-{int(r['name2'])}"
+                    if r["mass1"] >= r["mass2"]
+                    else f"b-{int(r['name2'])}-{int(r['name1'])}",
+                    axis=1,
+                ),
+                semi=lambda df: df.apply(
+                    lambda r: calc_semi_major_axis(
+                        m1=r["mass1"], m2=r["mass2"], period_days=np.power(10, r["p"])
+                    ),
+                    axis=1,
+                ),
+            )
+            if not f19_df.empty
+            else pd.DataFrame(
+                columns=["name1", "name2", "mass1", "mass2", "ecc", "p", "pair", "semi"]
+            )
+        )
+
+        mass_map = attr_df.set_index("name")["mass"].to_dict()
+
+        def _extend_id(n):
+            return (
+                [int(n)]
+                if (
+                    int(n) <= out34_snapshot.header["nzero"]
+                    and int(n) not in reg_bin_map
+                )
+                else [
+                    int(x)
+                    for x in reg_bin_map.get(int(n), [int(n)])
+                    if int(x) <= out34_snapshot.header["nzero"]
+                ]
+            )
+
+        # construct binary pairs DataFrame for both regularized and non-regularized binaries
+        pair_info_keys = [
+            "obj1_ids",
+            "obj2_ids",
+            "obj1_total_mass",
+            "obj2_total_mass",
+            "obj1_mass",
+            "obj2_mass",
+            "pair",
+            "semi",
+            "ecc",
+        ]
+
+        pair_dfs = [
+            pair_df
+            for pair_df in [reg_bin_pair_df, non_reg_bin_pair_df]
+            if not pair_df.empty
+        ]
+
+        if not pair_dfs:
+            pair_df = pd.DataFrame(columns=pair_info_keys)
+        else:
+            pair_df = (
+                pd.concat(
+                    pair_dfs,
+                    ignore_index=True,
+                )
+                .drop_duplicates(subset=["pair"])
+                .reset_index(drop=True)
+            )
+            # drop whose name1 / name2 NOT in main_df or cmName
+            pair_df = pair_df[
+                pair_df["name1"].isin(main_df["name"])
+                & pair_df["name2"].isin(main_df["name"])
+                & pair_df["pair"].isin(out9_snapshot.data["cmName"])
+            ].copy()
+            # extend obj1_ids and obj2_ids for regularized binaries
+            # and calculate information for obj1 and obj2
+            pair_df = (
+                pair_df.assign(
+                    obj1_ids=pair_df["name1"].map(_extend_id),
+                    obj2_ids=pair_df["name2"].map(_extend_id),
+                )
+                .assign(
+                    obj1_mass=lambda df: df["obj1_ids"].map(
+                        lambda ids: [mass_map.get(i) for i in ids]
+                    ),
+                    obj2_mass=lambda df: df["obj2_ids"].map(
+                        lambda ids: [mass_map.get(i) for i in ids]
+                    ),
+                )
+                .assign(
+                    obj1_total_mass=lambda df: df["obj1_mass"].map(sum),
+                    obj2_total_mass=lambda df: df["obj2_mass"].map(sum),
+                )
+            )
 
         return NBody6Snapshot(
             header=header_dict,
@@ -501,17 +529,7 @@ class NBody6OutputLoader:
                 ]
             ],
             binary_pair=pair_df.sort_values(by="name1").reset_index(drop=True)[
-                [
-                    "obj1_ids",
-                    "obj2_ids",
-                    "obj1_total_mass",
-                    "obj2_total_mass",
-                    "obj1_mass",
-                    "obj2_mass",
-                    "pair",
-                    "semi",
-                    "ecc",
-                ]
+                pair_info_keys
             ],
             raw_snapshot_dict={
                 "densCentre.txt": density_info_snapshot,
