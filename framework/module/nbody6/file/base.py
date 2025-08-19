@@ -15,7 +15,7 @@ class NBody6FileSnapshot:
 
     def __repr__(self):
         return (
-            f"{__class__.__name__}"
+            f"{type(self).__name__}"
             f"(header={self.header}, data_shape={self.data.shape}, header_ln_ref='{self.header_ln_ref}')"
         )
 
@@ -31,7 +31,7 @@ class NBody6FileParserBase(ABC):
         self._data: Optional[Dict[float, NBody6FileSnapshot]] = None
 
     def __repr__(self):
-        return f"{__class__.__name__}({self._filepath})"
+        return f"{type(self).__name__}({self._filepath})"
 
     def __len__(self):
         if self._data is not None:
