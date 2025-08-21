@@ -72,44 +72,37 @@ class NBody6OutputLoader:
     @property
     def raw_timestamps(self) -> Optional[List[float]]:
         if not self._raw_timestamps:
-            warnings.warn("Timestamps are not loaded. Call load() first.")
+            warnings.warn("Timestamps not loaded. Call `load()` first.")
         return self._raw_timestamps
 
     @property
     def timestamps(self) -> Optional[List[float]]:
         if self._timestamps is None:
-            warnings.warn("Snapshot dictionary is not initialized. Call merge() first.")
+            warnings.warn("Snapshots not merged. Call `merge()` first.")
             return None
         return self._timestamps
 
     @property
     def file_dict(self) -> Dict[str, NBody6FileParserBase]:
         if not self._is_file_dict_loaded:
-            warnings.warn(
-                "Parsers are created but not loaded yet. Call load() to read files."
-            )
+            warnings.warn("Parsers not loaded. Call `load()` to read files.")
         return self._file_dict
 
     @property
     def summary(self) -> Optional[pd.DataFrame]:
         if not self._stat_summary:
-            warnings.warn(
-                "Statistics summary is not available. Call summarize() first."
-            )
+            warnings.warn("Summary not available. Call `summarize()` after `merge()`.")
         return self._stat_summary
 
     def load(self, is_strict: bool = True) -> Dict[str, NBody6FileParserBase]:
         # check if files are already loaded. If so, reset them.
         if self._is_file_dict_loaded:
-            warnings.warn(
-                "Files are already loaded. Existing data will be cleared before reloading."
-            )
+            warnings.warn("Reloading files: ALL previous data will be discarded.")
             self._init_file_dict()
+            self._is_file_dict_loaded = False
 
         if not is_strict:
-            warnings.warn(
-                "Loading files in non-strict mode. `NaN` values may be present in the data."
-            )
+            warnings.warn("Non-strict load: Data may contain NaN values.")
 
         for filename, nbody6_file in self._file_dict.items():
             try:
@@ -127,9 +120,8 @@ class NBody6OutputLoader:
         timestamp_len_dict = {name: len(ts) for name, ts in timestamp_dict.items()}
         if len(set(timestamp_len_dict.values())) > 1:
             raise ValueError(
-                f"Error merging {self._root}: "
-                f"Timestamp lengths mismatch: {timestamp_len_dict}. "
-                "All files must have the same number of timestamps."
+                f"Merge failed for {self._root}: "
+                f"Expect ALL files have the same number of timestamps, got {timestamp_len_dict}."
             )
 
         for i, timestamps in enumerate(zip(*timestamp_dict.values())):
@@ -157,10 +149,10 @@ class NBody6OutputLoader:
 
     def get_snapshot(self, timestamp: float) -> Optional[NBody6Snapshot]:
         if not self._is_file_dict_loaded:
-            warnings.warn("File dictionary is not loaded. Call load() first.")
+            warnings.warn("Parsers not loaded. Call `load()` first.")
             return None
         if self._snapshot_dict is None:
-            warnings.warn("Snapshot dictionary is not initialized. Call merge() first.")
+            warnings.warn("Snapshots not merged. Call `merge()` first.")
             return None
         if timestamp in self._snapshot_dict:
             return self._snapshot_dict.get(timestamp)
@@ -168,25 +160,25 @@ class NBody6OutputLoader:
             merged_timestamps = self.timestamps
             if not merged_timestamps:
                 warnings.warn(
-                    "No merged snapshots available to find the closest timestamp."
+                    "No merged snapshots available to select a closest timestamp."
                 )
                 return None
             new_timestamp = merged_timestamps[
                 np.argmin(np.abs(np.array(merged_timestamps) - timestamp))
             ]
             warnings.warn(
-                f"Timestamp {timestamp} not found in snapshot dictionary. "
-                f"Returning snapshot for closest timestamp {new_timestamp}."
+                f"Timestamp {timestamp} not found. "
+                f"Returning closest snapshot at {new_timestamp:.2f} Myr."
             )
             return self._snapshot_dict.get(new_timestamp)
 
     @property
     def snapshot_dict(self) -> Optional[Dict[float, NBody6Snapshot]]:
         if self._snapshot_dict is None:
-            warnings.warn("Snapshot dictionary is not initialized. Call merge() first.")
+            warnings.warn("Snapshots not merged. Call `merge()` first.")
             return None
         if not self._is_file_dict_loaded:
-            warnings.warn("File dictionary is not loaded. Call load() first.")
+            warnings.warn("Parsers not loaded. Call `load()` first.")
         return self._snapshot_dict
 
     @property
@@ -201,7 +193,9 @@ class NBody6OutputLoader:
             warnings.warn("Raw data not loaded. Call load() first.")
             return self._snapshot_dict
         if self._timestamps:
-            warnings.warn("Snapshot dictionary already initialized. Overwriting.")
+            warnings.warn(
+                "Remerging snapshots: ALL previous merged-snapshots will be discarded."
+            )
             self._timestamps = None
 
         for timestamp in (
@@ -226,7 +220,7 @@ class NBody6OutputLoader:
                     nan_rows = data_df[data_df.isnull().any(axis=1)]
                     nan_ids = nan_rows[id_col].tolist()
                     msg = (
-                        f"{data_label} at {timestamp} contains NaN values. "
+                        f"{data_label}@{timestamp} Myr contains NaN values. "
                         "Possibly due to misaligned `name` values across files. "
                         f"IDs with NaN values: {nan_ids}. "
                     )
@@ -235,7 +229,7 @@ class NBody6OutputLoader:
                             msg + "\nSet `is_strict=False` to ignore this check."
                         )
                     else:
-                        warnings.warn(msg + "\nRows with NaN values will be dropped.")
+                        warnings.warn(msg + "\nDropping affected rows.")
                         setattr(
                             snapshot, attr_name, data_df.dropna().reset_index(drop=True)
                         )
@@ -243,7 +237,7 @@ class NBody6OutputLoader:
 
         if not self._snapshot_dict:
             warnings.warn(
-                "No valid snapshots found. Check if the input files are correct."
+                "No valid snapshots found. Verify input files and timestamps."
             )
 
         self._timestamps = sorted(self._snapshot_dict.keys())
@@ -260,9 +254,7 @@ class NBody6OutputLoader:
 
         # skip if cluster has dissolved
         if density_info_snapshot.header["r_tidal"] < 0:
-            warnings.warn(
-                f"Cluster has dissolved at timestamp {timestamp}. Terminating merging."
-            )
+            warnings.warn(f"Cluster dissolved at {timestamp} Myr. Stopping merge.")
             return None
 
         # collect header information
@@ -510,6 +502,24 @@ class NBody6OutputLoader:
 
             # extend obj1_ids and obj2_ids for regularized binaries
             # and calculate information for obj1 and obj2
+            missing_mass_ids = set(pair_df["name1"]).union(pair_df["name2"]) - set(
+                mass_map.keys()
+            )
+            if missing_mass_ids:
+                raise KeyError(
+                    f"Missing mass for IDs {missing_mass_ids}."
+                    " Check if binary components appear in `fort.82` or `fort.83`."
+                )
+
+            missing_rdc_ids = set(pair_df["name1"]).union(pair_df["name2"]) - set(
+                r_dc_df.index
+            )
+            if missing_rdc_ids:
+                raise KeyError(
+                    f"Missing density-center info for IDs {missing_rdc_ids}. "
+                    "Check if all binary components appear in `OUT34` and `OUT9`."
+                )
+
             pair_df = (
                 pair_df.assign(
                     obj1_ids=pair_df["name1"].map(_extend_id),
@@ -580,13 +590,11 @@ class NBody6OutputLoader:
         self, output_path: Union[str, Path], overwrite: bool = False
     ) -> None:
         if self._snapshot_dict is None:
-            raise ValueError(
-                "Snapshot dictionary is not initialized. Call merge() first."
-            )
+            raise ValueError("Snapshots not merged. Call `merge()` first.")
         output_path = Path(output_path).resolve()
         if output_path.exists() and not overwrite:
             raise FileExistsError(
-                f"File `{output_path}` already exists. Use overwrite=True to force overwrite."
+                f"File `{output_path}` already exists. Use `overwrite=True` to enforce overwrite."
             )
         joblib.dump(self._snapshot_dict, output_path)
         print(f"Snapshot dictionary exported to `{output_path}`.")
@@ -614,11 +622,11 @@ class NBody6OutputLoader:
 
     def summarize(self, is_verbose: bool = False) -> Optional[pd.DataFrame]:
         if self._snapshot_dict is None:
-            warnings.warn("Snapshot dictionary is not initialized. Call merge() first.")
+            warnings.warn("Snapshots not merged. Call `merge()` first.")
             return None
         if self._stat_summary is not None:
             warnings.warn(
-                "Statistics summary already exists. Overwriting the existing summary."
+                "Re-summarizing statistics: ALL previous summaries will be discarded."
             )
             self._stat_summary = None
 
@@ -656,7 +664,7 @@ class NBody6OutputLoader:
             return stats
 
         if self._snapshot_dict is None:
-            warnings.warn("Snapshot dictionary is not initialized. Call merge() first.")
+            warnings.warn("Snapshots not merged. Call `merge()` first.")
             return None
 
         simulation_stats_dicts = []
