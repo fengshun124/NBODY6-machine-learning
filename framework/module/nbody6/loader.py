@@ -72,37 +72,54 @@ class NBody6OutputLoader:
     @property
     def raw_timestamps(self) -> Optional[List[float]]:
         if not self._raw_timestamps:
-            warnings.warn("Timestamps not loaded. Call `load()` first.")
+            warnings.warn("Timestamps not loaded. Call `load()` first.", UserWarning)
         return self._raw_timestamps
 
     @property
     def timestamps(self) -> Optional[List[float]]:
         if self._timestamps is None:
-            warnings.warn("Snapshots not merged. Call `merge()` first.")
+            warnings.warn("Snapshots not merged. Call `merge()` first.", UserWarning)
             return None
         return self._timestamps
 
     @property
     def file_dict(self) -> Dict[str, NBody6FileParserBase]:
         if not self._is_file_dict_loaded:
-            warnings.warn("Parsers not loaded. Call `load()` to read files.")
+            warnings.warn(
+                "Parsers not loaded. Call `load()` to read files.", UserWarning
+            )
         return self._file_dict
 
     @property
     def summary(self) -> Optional[pd.DataFrame]:
         if not self._stat_summary:
-            warnings.warn("Summary not available. Call `summarize()` after `merge()`.")
+            warnings.warn(
+                "Summary not available. Call `summarize()` after `merge()`.",
+                UserWarning,
+            )
         return self._stat_summary
 
-    def load(self, is_strict: bool = True) -> Dict[str, NBody6FileParserBase]:
+    def load(
+        self,
+        is_strict: bool = True,
+        is_allow_trim: bool = False,
+        timestamp_tolerance: float = 2e-2,
+    ) -> Dict[str, NBody6FileParserBase]:
         # check if files are already loaded. If so, reset them.
         if self._is_file_dict_loaded:
-            warnings.warn("Reloading files: ALL previous data will be discarded.")
+            warnings.warn(
+                "Reloading files: ALL previous data will be discarded.", UserWarning
+            )
             self._init_file_dict()
             self._is_file_dict_loaded = False
 
         if not is_strict:
-            warnings.warn("Non-strict load: Data may contain NaN values.")
+            warnings.warn("Non-strict load: Data may contain NaN values.", UserWarning)
+
+        if is_allow_trim:
+            warnings.warn(
+                "Trim enabled: Loaded data may NOT cover full time range.", UserWarning
+            )
 
         for filename, nbody6_file in self._file_dict.items():
             try:
@@ -116,31 +133,79 @@ class NBody6OutputLoader:
             for name, nbody6_file in self._file_dict.items()
         }
 
+        timestamp_df = pd.DataFrame.from_dict(timestamp_dict, orient="index").T
         # check if all files have the same number of timestamps
-        timestamp_len_dict = {name: len(ts) for name, ts in timestamp_dict.items()}
-        if len(set(timestamp_len_dict.values())) > 1:
-            raise ValueError(
-                f"Merge failed for {self._root}: "
-                f"Expect ALL files have the same number of timestamps, got {timestamp_len_dict}."
-            )
-
-        for i, timestamps in enumerate(zip(*timestamp_dict.values())):
-            if max(timestamps) - min(timestamps) > 2e-2:
-                mismatched_timestamps = {
-                    name: ts[i] for name, ts in timestamp_dict.items()
-                }
-                raise ValueError(
-                    f"Error merging {self._root}: "
-                    f"Timestamp mismatch at index {i}: {mismatched_timestamps}"
+        if timestamp_df.notnull().sum(axis=0).nunique() > 1:
+            msg = f"Expected ALL files to have the same number of timestamps, but got {timestamp_df.notnull().sum(axis=0).to_dict()}."
+            if not is_allow_trim:
+                raise ValueError(f"Error aligning {self._root}: {msg}")
+            else:
+                warnings.warn(
+                    f"Consistency check warning for {self._root}: {msg} "
+                    "Trimming timestamps to those shared by ALL files.",
+                    UserWarning,
                 )
 
-        # set standard timestamps to OUT34
-        ref_timestamps = list(timestamp_dict["OUT34"])
+        # check if timestamps match within tolerance
+        ref_timestamp_file = "OUT34"
+        if not is_allow_trim:
+            mismatched_timestamp_df = timestamp_df[
+                timestamp_df.max(axis=1) - timestamp_df.min(axis=1)
+                > timestamp_tolerance
+            ]
+            mismatched_indices = mismatched_timestamp_df.index.tolist()
+            if mismatched_indices:
+                raise ValueError(
+                    f"Error aligning {self._root}: "
+                    f"Timestamp mismatch at index/indices {mismatched_indices}:\n"
+                    f"{mismatched_timestamp_df}"
+                )
+            # unify timestamps to OUT34
+            ref_timestamp_indices = timestamp_df.index.to_list()
+            ref_timestamps = timestamp_df.loc[
+                ref_timestamp_indices, ref_timestamp_file
+            ].values.tolist()
+
+        else:
+            trimmed_timestamp_df = timestamp_df.dropna()
+            trimmed_timestamp_df = trimmed_timestamp_df[
+                (trimmed_timestamp_df.max(axis=1) - trimmed_timestamp_df.min(axis=1))
+                <= timestamp_tolerance
+            ]
+            # stop if no common timestamps found
+            if trimmed_timestamp_df.empty:
+                raise ValueError(
+                    f"Error aligning {self._root}: No common timestamps found "
+                    f"within tolerance {timestamp_tolerance} Myr. "
+                    "Possibly corrupted or incomplete simulation output."
+                    f"{timestamp_df[~timestamp_df.index.isin(trimmed_timestamp_df.index)]}"
+                )
+
+            # unify timestamps to OUT34 in the trimmed set
+            ref_timestamp_indices = trimmed_timestamp_df.index.to_list()
+            ref_timestamps = trimmed_timestamp_df.loc[
+                ref_timestamp_indices, ref_timestamp_file
+            ].values.tolist()
+
+        # check if reference timestamps start from 0
+        if ref_timestamps[0] != 0:
+            warnings.warn(
+                f"Reference timestamps start from {ref_timestamps[0]:.2f} Myr instead of 0 Myr. "
+                "Possibly corrupted or incomplete simulation output.",
+                UserWarning,
+            )
+
         for name, nbody6_file in self._file_dict.items():
-            if name == "OUT34":
+            if name == ref_timestamp_file:
                 continue
-            for ts, ref_ts in zip(nbody6_file.timestamps, ref_timestamps):
-                if ts != ref_ts:
+            diff_indices = (
+                timestamp_df.loc[ref_timestamp_indices, name] != ref_timestamps
+            )
+            if diff_indices.any():
+                for ts, ref_ts in zip(
+                    timestamp_df.loc[ref_timestamp_indices, name][diff_indices],
+                    np.array(ref_timestamps)[diff_indices],
+                ):
                     nbody6_file.update_timestamp(ts, ref_ts)
 
         self._raw_timestamps = ref_timestamps
@@ -168,17 +233,18 @@ class NBody6OutputLoader:
             ]
             warnings.warn(
                 f"Timestamp {timestamp} not found. "
-                f"Returning closest snapshot at {new_timestamp:.2f} Myr."
+                f"Returning closest snapshot at {new_timestamp:.2f} Myr.",
+                UserWarning,
             )
             return self._snapshot_dict.get(new_timestamp)
 
     @property
     def snapshot_dict(self) -> Optional[Dict[float, NBody6Snapshot]]:
         if self._snapshot_dict is None:
-            warnings.warn("Snapshots not merged. Call `merge()` first.")
+            warnings.warn("Snapshots not merged. Call `merge()` first.", UserWarning)
             return None
         if not self._is_file_dict_loaded:
-            warnings.warn("Parsers not loaded. Call `load()` first.")
+            warnings.warn("Parsers not loaded. Call `load()` first.", UserWarning)
         return self._snapshot_dict
 
     @property
@@ -190,11 +256,12 @@ class NBody6OutputLoader:
     ) -> Dict[float, NBody6Snapshot]:
         self._snapshot_dict = {}
         if not self._raw_timestamps:
-            warnings.warn("Raw data not loaded. Call load() first.")
+            warnings.warn("Raw data not loaded. Call load() first.", UserWarning)
             return self._snapshot_dict
         if self._timestamps:
             warnings.warn(
-                "Remerging snapshots: ALL previous merged-snapshots will be discarded."
+                "Remerging snapshots: ALL previous merged-snapshots will be discarded.",
+                UserWarning,
             )
             self._timestamps = None
 
@@ -229,7 +296,7 @@ class NBody6OutputLoader:
                             msg + "\nSet `is_strict=False` to ignore this check."
                         )
                     else:
-                        warnings.warn(msg + "\nDropping affected rows.")
+                        warnings.warn(msg + "\nDropping affected rows.", UserWarning)
                         setattr(
                             snapshot, attr_name, data_df.dropna().reset_index(drop=True)
                         )
@@ -237,7 +304,8 @@ class NBody6OutputLoader:
 
         if not self._snapshot_dict:
             warnings.warn(
-                "No valid snapshots found. Verify input files and timestamps."
+                "No valid snapshots found. Verify input files and timestamps.",
+                UserWarning,
             )
 
         self._timestamps = sorted(self._snapshot_dict.keys())
@@ -254,7 +322,9 @@ class NBody6OutputLoader:
 
         # skip if cluster has dissolved
         if density_info_snapshot.header["r_tidal"] < 0:
-            warnings.warn(f"Cluster dissolved at {timestamp} Myr. Stopping merge.")
+            warnings.warn(
+                f"Cluster dissolved at {timestamp} Myr. Stopping merge.", UserWarning
+            )
             return None
 
         # collect header information
@@ -622,11 +692,12 @@ class NBody6OutputLoader:
 
     def summarize(self, is_verbose: bool = False) -> Optional[pd.DataFrame]:
         if self._snapshot_dict is None:
-            warnings.warn("Snapshots not merged. Call `merge()` first.")
+            warnings.warn("Snapshots not merged. Call `merge()` first.", UserWarning)
             return None
         if self._stat_summary is not None:
             warnings.warn(
-                "Re-summarizing statistics: ALL previous summaries will be discarded."
+                "Re-summarizing statistics: ALL previous summaries will be discarded.",
+                UserWarning,
             )
             self._stat_summary = None
 
@@ -664,7 +735,7 @@ class NBody6OutputLoader:
             return stats
 
         if self._snapshot_dict is None:
-            warnings.warn("Snapshots not merged. Call `merge()` first.")
+            warnings.warn("Snapshots not merged. Call `merge()` first.", UserWarning)
             return None
 
         simulation_stats_dicts = []

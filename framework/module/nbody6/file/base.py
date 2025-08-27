@@ -51,7 +51,7 @@ class NBody6FileParserBase(ABC):
         if self._data is None:
             warnings.warn("Data not loaded. Please call load() first.", UserWarning)
             return []
-        return list(self._data.keys())
+        return sorted(self._data.keys())
 
     def update_timestamp(self, old_timestamp: float, new_timestamp: float) -> None:
         if self._data is None:
@@ -241,12 +241,16 @@ class NBody6FileParserBase(ABC):
                         f"[{self._filename} - LINE {ln_num}] "
                         f"Possibly multiple system '{key}': {mapped_data[key]}."
                     )
-            except IndexError:
-                if not allow_missing:
-                    raise ValueError(f"Missing value for '{key}'") from None
-                mapped_data[key] = None
             except Exception as e:
-                raise ValueError(f"Cannot process value for '{key}': {e}") from e
+                if allow_missing:
+                    mapped_data[key] = None
+                    warnings.warn(
+                        f"[{self._filename} - LINE {ln_num}] "
+                        f"Cannot map '{key}': {e}. Setting it to None.",
+                        UserWarning,
+                    )
+                else:
+                    raise ValueError(f"Cannot process value for '{key}': {e}") from e
 
         if not mapped_data:
             raise ValueError("No data mapped from tokens")
