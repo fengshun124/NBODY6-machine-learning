@@ -6,8 +6,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import joblib
 import numpy as np
 import pandas as pd
-from matplotlib import pyplot as plt
-from matplotlib.animation import FuncAnimation
 from tqdm.auto import tqdm
 
 from module.nbody6.calc.binary import calc_semi_major_axis
@@ -18,7 +16,6 @@ from module.nbody6.file.fort83 import NBody6Fort83
 from module.nbody6.file.misc import NBody6DensityCenterFile
 from module.nbody6.file.out9 import NBody6OUT9
 from module.nbody6.file.out34 import NBody6OUT34
-from module.nbody6.plot.animate import animate_nbody6_snapshots
 
 
 @dataclass
@@ -37,16 +34,16 @@ class NBody6Snapshot:
 class NBody6OutputLoader:
     def __init__(self, root: Union[str, Path]) -> None:
         self._root = Path(root).resolve()
-        self._file_dict: Dict[str, NBody6FileParserBase] = {}
+        self._nbody6_file_dict: Dict[str, NBody6FileParserBase] = {}
         self._init_file_dict()
-        self._is_file_dict_loaded = False
+        self._is_nbody6_file_dict_loaded = False
         self._snapshot_dict: Optional[Dict[float, NBody6Snapshot]] = None
         self._raw_timestamps: Optional[List[float]] = None
         self._timestamps: Optional[List[float]] = None
         self._stat_summary: Optional[pd.DataFrame] = None
 
     def _init_file_dict(self) -> None:
-        self._file_dict = {
+        self._nbody6_file_dict = {
             "densCentre.txt": NBody6DensityCenterFile(self._root / "densCentre.txt"),
             "OUT34": NBody6OUT34(self._root / "OUT34"),
             "OUT9": NBody6OUT9(self._root / "OUT9"),
@@ -83,12 +80,12 @@ class NBody6OutputLoader:
         return self._timestamps
 
     @property
-    def file_dict(self) -> Dict[str, NBody6FileParserBase]:
-        if not self._is_file_dict_loaded:
+    def nbody6_file_dict(self) -> Dict[str, NBody6FileParserBase]:
+        if not self._is_nbody6_file_dict_loaded:
             warnings.warn(
                 "Parsers not loaded. Call `load()` to read files.", UserWarning
             )
-        return self._file_dict
+        return self._nbody6_file_dict
 
     @property
     def summary(self) -> Optional[pd.DataFrame]:
@@ -106,12 +103,12 @@ class NBody6OutputLoader:
         timestamp_tolerance: float = 2e-2,
     ) -> Dict[str, NBody6FileParserBase]:
         # check if files are already loaded. If so, reset them.
-        if self._is_file_dict_loaded:
+        if self._is_nbody6_file_dict_loaded:
             warnings.warn(
                 "Reloading files: ALL previous data will be discarded.", UserWarning
             )
             self._init_file_dict()
-            self._is_file_dict_loaded = False
+            self._is_nbody6_file_dict_loaded = False
 
         if not is_strict:
             warnings.warn("Non-strict load: Data may contain NaN values.", UserWarning)
@@ -121,7 +118,7 @@ class NBody6OutputLoader:
                 "Trim enabled: Loaded data may NOT cover full time range.", UserWarning
             )
 
-        for filename, nbody6_file in self._file_dict.items():
+        for filename, nbody6_file in self._nbody6_file_dict.items():
             try:
                 nbody6_file.load(is_strict=is_strict)
             except Exception as e:
@@ -130,13 +127,16 @@ class NBody6OutputLoader:
         # check if all files share the same timestamps with tolerance of 1e-2
         timestamp_dict = {
             name: nbody6_file.timestamps
-            for name, nbody6_file in self._file_dict.items()
+            for name, nbody6_file in self._nbody6_file_dict.items()
         }
 
         timestamp_df = pd.DataFrame.from_dict(timestamp_dict, orient="index").T
         # check if all files have the same number of timestamps
         if timestamp_df.notnull().sum(axis=0).nunique() > 1:
-            msg = f"Expected ALL files to have the same number of timestamps, but got {timestamp_df.notnull().sum(axis=0).to_dict()}."
+            msg = (
+                "Expected ALL files to have the same number of timestamps, "
+                f"but got {timestamp_df.notnull().sum(axis=0).to_dict()}."
+            )
             if not is_allow_trim:
                 raise ValueError(f"Error aligning {self._root}: {msg}")
             else:
@@ -174,11 +174,29 @@ class NBody6OutputLoader:
             ]
             # stop if no common timestamps found
             if trimmed_timestamp_df.empty:
+                timestamp_stats = {
+                    name: (
+                        lambda arr: {
+                            "min": round(float(np.nanmin(arr)), 3),
+                            "max": round(float(np.nanmax(arr)), 3),
+                            "step": round(
+                                float(
+                                    np.nanmean(np.diff(pd.Series(arr).dropna().values))
+                                ),
+                                4,
+                            )
+                            if np.sum(~np.isnan(arr)) > 1
+                            else None,
+                            "count": int(np.sum(~np.isnan(arr))),
+                        }
+                    )(timestamp_df[name].values.astype(float))
+                    for name in timestamp_df.columns
+                }
                 raise ValueError(
                     f"Error aligning {self._root}: No common timestamps found "
-                    f"within tolerance {timestamp_tolerance} Myr. "
-                    "Possibly corrupted or incomplete simulation output."
-                    f"{timestamp_df[~timestamp_df.index.isin(trimmed_timestamp_df.index)]}"
+                    f"within tolerance {timestamp_tolerance} Myr, "
+                    "which may indicate corrupted or incomplete simulation output. "
+                    f"Timestamps stats: {timestamp_stats}"
                 )
 
             # unify timestamps to OUT34 in the trimmed set
@@ -195,7 +213,7 @@ class NBody6OutputLoader:
                 UserWarning,
             )
 
-        for name, nbody6_file in self._file_dict.items():
+        for name, nbody6_file in self._nbody6_file_dict.items():
             if name == ref_timestamp_file:
                 continue
             diff_indices = (
@@ -209,11 +227,11 @@ class NBody6OutputLoader:
                     nbody6_file.update_timestamp(ts, ref_ts)
 
         self._raw_timestamps = ref_timestamps
-        self._is_file_dict_loaded = True
-        return self._file_dict
+        self._is_nbody6_file_dict_loaded = True
+        return self._nbody6_file_dict
 
     def get_snapshot(self, timestamp: float) -> Optional[NBody6Snapshot]:
-        if not self._is_file_dict_loaded:
+        if not self._is_nbody6_file_dict_loaded:
             warnings.warn("Parsers not loaded. Call `load()` first.")
             return None
         if self._snapshot_dict is None:
@@ -243,7 +261,7 @@ class NBody6OutputLoader:
         if self._snapshot_dict is None:
             warnings.warn("Snapshots not merged. Call `merge()` first.", UserWarning)
             return None
-        if not self._is_file_dict_loaded:
+        if not self._is_nbody6_file_dict_loaded:
             warnings.warn("Parsers not loaded. Call `load()` first.", UserWarning)
         return self._snapshot_dict
 
@@ -313,12 +331,12 @@ class NBody6OutputLoader:
 
     def _merge(self, timestamp: float) -> Optional[NBody6Snapshot]:
         # extract snapshots with header and data from corresponding timestamp
-        out34_snapshot = self._file_dict["OUT34"][timestamp]
-        out9_snapshot = self._file_dict["OUT9"][timestamp]
-        fort19_snapshot = self._file_dict["fort.19"][timestamp]
-        fort82_snapshot = self._file_dict["fort.82"][timestamp]
-        fort83_snapshot = self._file_dict["fort.83"][timestamp]
-        density_info_snapshot = self._file_dict["densCentre.txt"][timestamp]
+        out34_snapshot = self._nbody6_file_dict["OUT34"][timestamp]
+        out9_snapshot = self._nbody6_file_dict["OUT9"][timestamp]
+        fort19_snapshot = self._nbody6_file_dict["fort.19"][timestamp]
+        fort82_snapshot = self._nbody6_file_dict["fort.82"][timestamp]
+        fort83_snapshot = self._nbody6_file_dict["fort.83"][timestamp]
+        density_info_snapshot = self._nbody6_file_dict["densCentre.txt"][timestamp]
 
         # skip if cluster has dissolved
         if density_info_snapshot.header["r_tidal"] < 0:
@@ -668,27 +686,6 @@ class NBody6OutputLoader:
             )
         joblib.dump(self._snapshot_dict, output_path)
         print(f"Snapshot dictionary exported to `{output_path}`.")
-
-    def animate_snapshots(
-        self,
-        output_path: Union[str, Path],
-        fig_title_text: Optional[str] = None,
-        animation_fps: int = 10,
-        animation_dpi: int = 300,
-    ) -> FuncAnimation:
-        snapshot_list = self.snapshot_list
-        if not snapshot_list:
-            raise ValueError("No snapshots available to animate.")
-        animation = animate_nbody6_snapshots(
-            snapshot_list=snapshot_list,
-            output_path=output_path,
-            fig_title_text=fig_title_text,
-            animation_fps=animation_fps,
-            animation_dpi=animation_dpi,
-        )
-        if not output_path:
-            plt.show()
-        return animation
 
     def summarize(self, is_verbose: bool = False) -> Optional[pd.DataFrame]:
         if self._snapshot_dict is None:
