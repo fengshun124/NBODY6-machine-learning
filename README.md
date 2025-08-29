@@ -2,6 +2,7 @@
 
 ## Requirements
 
+- Python 3.11+
 - PyTorch
 - PyTorch Lightning
 - NumPy
