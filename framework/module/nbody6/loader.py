@@ -38,8 +38,7 @@ def _emit_exception(
                     raise err from detail
         raise err
 
-    warning_msg = message + f"\n{note}"
-    warnings.warn(warning_msg, category=warn_category, stacklevel=stacklevel)
+    warnings.warn(f"{message} {note}", category=warn_category, stacklevel=stacklevel)
 
 
 @dataclass
@@ -313,17 +312,18 @@ class NBody6OutputLoader:
             self._timestamps = None
 
         for timestamp in (
-            pbar := tqdm(self._raw_timestamps, leave=False)
-            if is_verbose
-            else self._raw_timestamps
+            ts_pbar := tqdm(
+                self._raw_timestamps,
+                position=0,
+                leave=False,
+                disable=not is_verbose,
+                dynamic_ncols=True,
+            )
         ):
+            ts_pbar.set_description(f"Merging Snapshot@{timestamp:.2f} Myr")
             snapshot = self._merge(timestamp, is_strict=is_strict)
             if snapshot is None:
                 break
-
-            if is_verbose:
-                pbar.set_description(f"Merging Snapshot@{timestamp:.2f} Myr")
-
             self._snapshot_dict[timestamp] = snapshot
 
         if not self._snapshot_dict:
@@ -335,268 +335,270 @@ class NBody6OutputLoader:
         self._timestamps = sorted(self._snapshot_dict.keys())
         return self._snapshot_dict
 
-    # sub-methods for merging snapshots at single timestamp
-    _POS_VEL_KEYS = ["x", "y", "z", "vx", "vy", "vz"]
-    _DENSITY_CENTER_DIST_KEYS = ["r_dc", "r_dc_r_tidal"]
-    _ATTR_KEYS = ["mass", "zlum", "rad", "tempe"]
-    _BINARY_ATTR_KEYS = ["ecc", "semi", "log_period_days"]
-    _BINARY_PAIR_KEYS = [
-        "obj1_ids",
-        "obj2_ids",
-        "obj1_mass",
-        "obj2_mass",
-        "obj1_total_mass",
-        "obj2_total_mass",
-        "obj1_r_dc",
-        "obj2_r_dc",
-        "obj1_r_dc_r_tidal",
-        "obj2_r_dc_r_tidal",
-        *_BINARY_ATTR_KEYS,
-    ]
+    def _merge(self, timestamp: float, is_strict: bool) -> Optional[NBody6Snapshot]:
+        # key definitions
+        _POS_VEL_KEYS = ["x", "y", "z", "vx", "vy", "vz"]
+        _DENSITY_CENTER_DIST_KEYS = ["r_dc", "r_dc_r_tidal"]
+        _ATTR_KEYS = ["mass", "zlum", "rad", "tempe"]
+        _BINARY_ATTR_KEYS = ["ecc", "semi", "log_period_days"]
+        _BINARY_PAIR_KEYS = [
+            "obj1_ids",
+            "obj2_ids",
+            "obj1_mass",
+            "obj2_mass",
+            "obj1_total_mass",
+            "obj2_total_mass",
+            "obj1_r_dc",
+            "obj2_r_dc",
+            "obj1_r_dc_r_tidal",
+            "obj2_r_dc_r_tidal",
+            *_BINARY_ATTR_KEYS,
+        ]
 
-    @staticmethod
-    def _merge_build_header_dict(
-        density_info_snapshot: NBody6FileSnapshot, out34_snapshot: NBody6FileSnapshot
-    ) -> Dict[str, Any]:
-        return {
-            "time": out34_snapshot.header["time"],
-            "r_tidal": density_info_snapshot.header["r_tidal"],
-            "cluster_density_center": (
-                density_info_snapshot.header["density_center_x"],
-                density_info_snapshot.header["density_center_y"],
-                density_info_snapshot.header["density_center_z"],
-            ),
-            "r_tidal_out34": out34_snapshot.header["rtide"],
-            "cluster_density_center_out34": tuple(
-                map(float, out34_snapshot.header["rd"])
-            ),
-            "cluster_mass_center_out34": tuple(
-                map(float, out34_snapshot.header["rcm"])
-            ),
-            "cluster_gal_position_out34": (
-                out34_snapshot.header["rg"] * out34_snapshot.header["rbar"]
-            ),
-            "cluster_gal_velocity_out34": (
-                out34_snapshot.header["vg"] * out34_snapshot.header["vstar"]
-            ),
-        }
+        def _build_header_dict(
+            density_info_snap: NBody6FileSnapshot,
+            o34_snap: NBody6FileSnapshot,
+        ) -> Dict[str, Any]:
+            return {
+                "time": o34_snap.header["time"],
+                "r_tidal": density_info_snap.header["r_tidal"],
+                "cluster_density_center": (
+                    density_info_snap.header["density_center_x"],
+                    density_info_snap.header["density_center_y"],
+                    density_info_snap.header["density_center_z"],
+                ),
+                "r_tidal_out34": o34_snap.header["rtide"],
+                "cluster_density_center_out34": tuple(
+                    map(float, o34_snap.header["rd"])
+                ),
+                "cluster_mass_center_out34": tuple(map(float, o34_snap.header["rcm"])),
+                "cluster_gal_position_out34": (
+                    o34_snap.header["rg"] * o34_snap.header["rbar"]
+                ),
+                "cluster_gal_velocity_out34": (
+                    o34_snap.header["vg"] * o34_snap.header["vstar"]
+                ),
+            }
 
-    def _merge_build_pos_vel_df(
-        self,
-        out34_snapshot: NBody6FileSnapshot,
-        out9_snapshot: NBody6FileSnapshot,
-        density_info_snapshot: NBody6FileSnapshot,
-    ) -> Tuple[pd.DataFrame, Dict[int, List[int]]]:
-        atomic_pos_vel_df = out34_snapshot.data.copy()[["name"] + self._POS_VEL_KEYS]
-        # distance to `densCentre.txt`-obtained density center in parsecs
-        atomic_pos_vel_df["r_dc"] = np.linalg.norm(
-            atomic_pos_vel_df[["x", "y", "z"]].values
-            - np.array(
-                [
-                    density_info_snapshot.header["density_center_x"],
-                    density_info_snapshot.header["density_center_y"],
-                    density_info_snapshot.header["density_center_z"],
-                ]
-            ),
-            axis=1,
-        )
-        # normalized distance to tidal radius
-        atomic_pos_vel_df["r_dc_r_tidal"] = (
-            atomic_pos_vel_df["r_dc"] / density_info_snapshot.header["r_tidal"]
-        )
-
-        # construct regularized binary map from OUT9
-        reg_bin_map = (
-            out9_snapshot.data.copy()
-            .melt(id_vars=["cmName"], value_vars=["name1", "name2"], value_name="name")
-            .drop(columns="variable")
-            .groupby("cmName")["name"]
-            .apply(list)
-            .to_dict()
-        )
-
-        # extend pos / vel information to full table
-        pos_vel_df = pd.DataFrame(
-            [
-                row
-                for rows in atomic_pos_vel_df.copy().apply(
-                    lambda r: (
-                        [
-                            (
-                                r["name"],
-                                *r[self._POS_VEL_KEYS + self._DENSITY_CENTER_DIST_KEYS],
-                            )
-                        ]
-                        if (r["name"] not in reg_bin_map)
-                        else [
-                            (n, *r[self._POS_VEL_KEYS + self._DENSITY_CENTER_DIST_KEYS])
-                            for n in reg_bin_map[r["name"]]
-                        ]
-                    ),
-                    axis=1,
-                )
-                for row in rows
-            ],
-            columns=["name"] + self._POS_VEL_KEYS + self._DENSITY_CENTER_DIST_KEYS,
-        ).astype({"name": int})
-
-        return pos_vel_df, reg_bin_map
-
-    def _merge_build_attr_df(
-        self,
-        timestamp: float,
-        fort82_snapshot: NBody6FileSnapshot,
-        fort83_snapshot: NBody6FileSnapshot,
-    ) -> Tuple[pd.DataFrame, Dict[int, float]]:
-        reg_bin_attr_df = pd.concat(
-            [
-                fort82_snapshot.data.copy().rename(
-                    columns={f"{attr}{i}": attr for attr in ["name"] + self._ATTR_KEYS}
-                )[["name"] + self._ATTR_KEYS]
-                for i in (1, 2)
-            ],
-            ignore_index=True,
-        ).drop_duplicates(subset=["name"])
-
-        attr_df = pd.concat(
-            [
-                reg_bin_attr_df,
-                fort83_snapshot.data.copy()[["name"] + self._ATTR_KEYS],
-            ]
-        )
-
-        if attr_df["name"].duplicated().any():
-            duplicate_names = attr_df[attr_df["name"].duplicated()]["name"].unique()
-            warnings.warn(
-                f"Duplicate names found in attributes at {timestamp} Myr: {duplicate_names}. "
-                "Keeping the first occurrence.",
-                UserWarning,
+        def _build_pos_vel_df(
+            o34_snap: NBody6FileSnapshot,
+            o9_snap: NBody6FileSnapshot,
+            density_info_snap: NBody6FileSnapshot,
+        ) -> Tuple[pd.DataFrame, Dict[int, List[int]]]:
+            atomic_pos_vel_df = o34_snap.data.copy()[["name"] + _POS_VEL_KEYS]
+            # distance to `densCentre.txt`-obtained density center in parsecs
+            atomic_pos_vel_df["r_dc"] = np.linalg.norm(
+                atomic_pos_vel_df[["x", "y", "z"]].values
+                - np.array(
+                    [
+                        density_info_snap.header["density_center_x"],
+                        density_info_snap.header["density_center_y"],
+                        density_info_snap.header["density_center_z"],
+                    ]
+                ),
+                axis=1,
             )
-            attr_df = attr_df.drop_duplicates(subset=["name"], keep="first")
+            # normalized distance to tidal radius
+            atomic_pos_vel_df["r_dc_r_tidal"] = (
+                atomic_pos_vel_df["r_dc"] / density_info_snap.header["r_tidal"]
+            )
 
-        mass_map = attr_df.set_index("name")["mass"].to_dict()
+            # construct regularized binary map from OUT9
+            reg_bin_map = (
+                o9_snap.data.copy()
+                .melt(
+                    id_vars=["cmName"], value_vars=["name1", "name2"], value_name="name"
+                )
+                .drop(columns="variable")
+                .groupby("cmName")["name"]
+                .apply(list)
+                .to_dict()
+            )
 
-        return attr_df.reset_index(drop=True), mass_map
+            # extend pos / vel information to full table
+            pos_vel_df = pd.DataFrame(
+                [
+                    row
+                    for rows in atomic_pos_vel_df.copy().apply(
+                        lambda r: (
+                            [
+                                (
+                                    r["name"],
+                                    *r[_POS_VEL_KEYS + _DENSITY_CENTER_DIST_KEYS],
+                                )
+                            ]
+                            if (r["name"] not in reg_bin_map)
+                            else [
+                                (
+                                    n,
+                                    *r[_POS_VEL_KEYS + _DENSITY_CENTER_DIST_KEYS],
+                                )
+                                for n in reg_bin_map[r["name"]]
+                            ]
+                        ),
+                        axis=1,
+                    )
+                    for row in rows
+                ],
+                columns=["name"] + _POS_VEL_KEYS + _DENSITY_CENTER_DIST_KEYS,
+            ).astype({"name": int})
 
-    def _merge_build_binary_pair_df(
-        self,
-        timestamp: float,
-        out9_snapshot: NBody6FileSnapshot,
-        fort19_snapshot: NBody6FileSnapshot,
-        reg_bin_map: Dict[int, List[int]],
-        mass_map: Dict[int, float],
-        r_dc_map: Dict[int, Dict[str, float]],
-    ) -> pd.DataFrame:
-        reg_bin_pair_df = (
-            (
-                out9_snapshot.data.copy()
+            return pos_vel_df, reg_bin_map
+
+        def _build_attr_df(
+            f82_snap: NBody6FileSnapshot,
+            f83_snap: NBody6FileSnapshot,
+        ) -> Tuple[pd.DataFrame, Dict[int, float]]:
+            reg_bin_attr_df = pd.concat(
+                [
+                    f82_snap.data.copy().rename(
+                        columns={f"{attr}{i}": attr for attr in ["name"] + _ATTR_KEYS}
+                    )[["name"] + _ATTR_KEYS]
+                    for i in (1, 2)
+                ],
+                ignore_index=True,
+            ).drop_duplicates(subset=["name"])
+
+            attr_df = pd.concat(
+                [
+                    reg_bin_attr_df,
+                    f83_snap.data.copy()[["name"] + _ATTR_KEYS],
+                ]
+            )
+
+            if attr_df["name"].duplicated().any():
+                duplicate_names = attr_df[attr_df["name"].duplicated()]["name"].unique()
+                warnings.warn(
+                    f"Duplicate names found in attributes at {timestamp} Myr: {duplicate_names}. "
+                    "Keeping the first occurrence.",
+                    UserWarning,
+                )
+                attr_df = attr_df.drop_duplicates(subset=["name"], keep="first")
+
+            mass_map = attr_df.set_index("name")["mass"].to_dict()
+
+            return attr_df.reset_index(drop=True), mass_map
+
+        def _build_binary_pair_df(
+            o9_snapshot: NBody6FileSnapshot,
+            f19_snapshot: NBody6FileSnapshot,
+            reg_bin_map: Dict[int, List[int]],
+            mass_map: Dict[int, float],
+            r_dc_map: Dict[int, Dict[str, float]],
+        ) -> pd.DataFrame:
+            reg_bin_pair_df = (
+                (
+                    o9_snapshot.data.copy()
+                    .assign(
+                        semi=lambda df: df.apply(
+                            lambda r: calc_semi_major_axis(
+                                m1_sol=r["mass1"],
+                                m2_sol=r["mass2"],
+                                period_days=np.power(10, r["p"]),
+                            ),
+                            axis=1,
+                        ),
+                    )
+                    .rename(columns={"cmName": "pair", "p": "log_period_days"})
+                )
+                if not o9_snapshot.data.empty
+                else pd.DataFrame(
+                    columns=["name1", "name2", "mass1", "mass2", "pair"]
+                    + self._BINARY_ATTR_KEYS
+                )
+            )
+
+            non_reg_bin_pair_df = (
+                f19_snapshot.data.copy()[
+                    ["name1", "name2", "mass1", "mass2", "ecc", "p"]
+                ]
                 .assign(
+                    pair=lambda df: df.apply(
+                        lambda r: f"b-{int(r['name1'])}-{int(r['name2'])}"
+                        if r["mass1"] >= r["mass2"]
+                        else f"b-{int(r['name2'])}-{int(r['name1'])}",
+                        axis=1,
+                    ),
                     semi=lambda df: df.apply(
                         lambda r: calc_semi_major_axis(
-                            m1=r["mass1"],
-                            m2=r["mass2"],
+                            m1_sol=r["mass1"],
+                            m2_sol=r["mass2"],
                             period_days=np.power(10, r["p"]),
                         ),
                         axis=1,
                     ),
                 )
-                .rename(columns={"cmName": "pair", "p": "log_period_days"})
+                .rename(columns={"p": "log_period_days"})
+                if not f19_snapshot.data.empty
+                else pd.DataFrame(
+                    columns=["name1", "name2", "mass1", "mass2", "pair"]
+                    + self._BINARY_ATTR_KEYS
+                )
             )
-            if not out9_snapshot.data.empty
-            else pd.DataFrame(
-                columns=["name1", "name2", "mass1", "mass2", "pair"]
-                + self._BINARY_ATTR_KEYS
-            )
-        )
 
-        non_reg_bin_pair_df = (
-            fort19_snapshot.data.copy()[
-                ["name1", "name2", "mass1", "mass2", "ecc", "p"]
+            pair_dfs = [
+                pair_df
+                for pair_df in [reg_bin_pair_df, non_reg_bin_pair_df]
+                if not pair_df.empty
             ]
-            .assign(
-                pair=lambda df: df.apply(
-                    lambda r: f"b-{int(r['name1'])}-{int(r['name2'])}"
-                    if r["mass1"] >= r["mass2"]
-                    else f"b-{int(r['name2'])}-{int(r['name1'])}",
-                    axis=1,
-                ),
-                semi=lambda df: df.apply(
-                    lambda r: calc_semi_major_axis(
-                        m1=r["mass1"], m2=r["mass2"], period_days=np.power(10, r["p"])
-                    ),
-                    axis=1,
-                ),
-            )
-            .rename(columns={"p": "log_period_days"})
-            if not fort19_snapshot.data.empty
-            else pd.DataFrame(
-                columns=["name1", "name2", "mass1", "mass2", "pair"]
-                + self._BINARY_ATTR_KEYS
-            )
-        )
 
-        pair_dfs = [
-            pair_df
-            for pair_df in [reg_bin_pair_df, non_reg_bin_pair_df]
-            if not pair_df.empty
-        ]
+            if not pair_dfs:
+                pair_df = pd.DataFrame(columns=["name1"] + _BINARY_PAIR_KEYS)
+            else:
+                pair_df = pd.concat(pair_dfs, ignore_index=True)
+                # warn if duplicate pairs found
+                if pair_df["pair"].duplicated().any():
+                    duplicate_pairs = pair_df[pair_df["pair"].duplicated()][
+                        "pair"
+                    ].unique()
+                    warnings.warn(
+                        f"Duplicate pairs found in binary pairs at {timestamp} Myr: {duplicate_pairs}. "
+                        "Keeping the first occurrence.",
+                        UserWarning,
+                    )
+                    pair_df = pair_df.drop_duplicates(subset=["pair"], keep="first")
 
-        if not pair_dfs:
-            pair_df = pd.DataFrame(columns=["name1"] + self._BINARY_PAIR_KEYS)
-        else:
-            pair_df = pd.concat(pair_dfs, ignore_index=True)
-            # warn if duplicate pairs found
-            if pair_df["pair"].duplicated().any():
-                duplicate_pairs = pair_df[pair_df["pair"].duplicated()]["pair"].unique()
-                warnings.warn(
-                    f"Duplicate pairs found in binary pairs at {timestamp} Myr: {duplicate_pairs}. "
-                    "Keeping the first occurrence.",
-                    UserWarning,
+                pair_df = (
+                    pair_df.assign(
+                        obj1_ids=pair_df["name1"].map(
+                            lambda name: reg_bin_map.get(name, [name]),
+                        ),
+                        obj2_ids=pair_df["name2"].map(
+                            lambda name: reg_bin_map.get(name, [name]),
+                        ),
+                    )
+                    .assign(
+                        obj1_mass=lambda df: df["obj1_ids"].map(
+                            lambda ids: [mass_map.get(i) for i in ids]
+                            if set(ids).issubset(mass_map)
+                            else None
+                        ),
+                        obj2_mass=lambda df: df["obj2_ids"].map(
+                            lambda ids: [mass_map.get(i) for i in ids]
+                            if set(ids).issubset(mass_map)
+                            else None
+                        ),
+                    )
+                    .assign(
+                        obj1_total_mass=lambda df: df["obj1_mass"].map(np.sum),
+                        obj2_total_mass=lambda df: df["obj2_mass"].map(np.sum),
+                        obj1_r_dc=lambda df: df["name1"].map(
+                            lambda n: r_dc_map.get(n, {}).get("r_dc", np.nan)
+                        ),
+                        obj2_r_dc=lambda df: df["name2"].map(
+                            lambda n: r_dc_map.get(n, {}).get("r_dc", np.nan)
+                        ),
+                        obj1_r_dc_r_tidal=lambda df: df["name1"].map(
+                            lambda n: r_dc_map.get(n, {}).get("r_dc_r_tidal", np.nan)
+                        ),
+                        obj2_r_dc_r_tidal=lambda df: df["name2"].map(
+                            lambda n: r_dc_map.get(n, {}).get("r_dc_r_tidal", np.nan)
+                        ),
+                    )
                 )
-                pair_df = pair_df.drop_duplicates(subset=["pair"], keep="first")
 
-            pair_df = (
-                pair_df.assign(
-                    obj1_ids=pair_df["name1"].map(
-                        lambda name: reg_bin_map.get(name, [name]),
-                    ),
-                    obj2_ids=pair_df["name2"].map(
-                        lambda name: reg_bin_map.get(name, [name]),
-                    ),
-                )
-                .assign(
-                    obj1_mass=lambda df: df["obj1_ids"].map(
-                        lambda ids: [mass_map.get(i) for i in ids]
-                        if set(ids).issubset(mass_map)
-                        else None
-                    ),
-                    obj2_mass=lambda df: df["obj2_ids"].map(
-                        lambda ids: [mass_map.get(i) for i in ids]
-                        if set(ids).issubset(mass_map)
-                        else None
-                    ),
-                )
-                .assign(
-                    obj1_total_mass=lambda df: df["obj1_mass"].map(np.sum),
-                    obj2_total_mass=lambda df: df["obj2_mass"].map(np.sum),
-                    obj1_r_dc=lambda df: df["name1"].map(
-                        lambda n: r_dc_map.get(n, {}).get("r_dc", np.nan)
-                    ),
-                    obj2_r_dc=lambda df: df["name2"].map(
-                        lambda n: r_dc_map.get(n, {}).get("r_dc", np.nan)
-                    ),
-                    obj1_r_dc_r_tidal=lambda df: df["name1"].map(
-                        lambda n: r_dc_map.get(n, {}).get("r_dc_r_tidal", np.nan)
-                    ),
-                    obj2_r_dc_r_tidal=lambda df: df["name2"].map(
-                        lambda n: r_dc_map.get(n, {}).get("r_dc_r_tidal", np.nan)
-                    ),
-                )
-            )
+            return pair_df.reset_index(drop=True)
 
-        return pair_df.reset_index(drop=True)
-
-    def _merge(self, timestamp: float, is_strict: bool) -> Optional[NBody6Snapshot]:
         # skip if cluster has dissolved
         density_info_snapshot = self._nbody6_file_dict["densCentre.txt"][timestamp]
         if density_info_snapshot.header["r_tidal"] < 0:
@@ -613,27 +615,30 @@ class NBody6OutputLoader:
         fort83_snapshot = self._nbody6_file_dict["fort.83"][timestamp]
 
         # collect header information
-        header_dict = self._merge_build_header_dict(
-            density_info_snapshot=density_info_snapshot, out34_snapshot=out34_snapshot
+        header_dict = _build_header_dict(
+            o34_snap=out34_snapshot, density_info_snap=density_info_snapshot
         )
 
         # collect position and velocity information
-        pos_vel_df, reg_bin_map = self._merge_build_pos_vel_df(
-            out34_snapshot=out34_snapshot,
-            out9_snapshot=out9_snapshot,
-            density_info_snapshot=density_info_snapshot,
+        position_velocity_df, regularized_binary_map = _build_pos_vel_df(
+            o34_snap=out34_snapshot,
+            o9_snap=out9_snapshot,
+            density_info_snap=density_info_snapshot,
         )
 
         # collect attribute information
-        attr_df, mass_map = self._merge_build_attr_df(
-            timestamp=timestamp,
-            fort82_snapshot=fort82_snapshot,
-            fort83_snapshot=fort83_snapshot,
+        attribute_df, star_mass_map = _build_attr_df(
+            f82_snap=fort82_snapshot,
+            f83_snap=fort83_snapshot,
         )
 
-        main_df = pd.merge(attr_df, pos_vel_df, on="name", how="inner")
+        main_data_df = pd.merge(
+            attribute_df, position_velocity_df, on="name", how="inner"
+        )
         # check if any names in pos_vel_df and attr_df are missing after merge
-        missing_pos_vel_names = set(pos_vel_df["name"]) - set(main_df["name"])
+        missing_pos_vel_names = set(position_velocity_df["name"]) - set(
+            main_data_df["name"]
+        )
         if missing_pos_vel_names:
             _emit_exception(
                 exception=ValueError,
@@ -646,7 +651,7 @@ class NBody6OutputLoader:
                 is_strict=is_strict,
             )
 
-        missing_attr_names = set(attr_df["name"]) - set(main_df["name"])
+        missing_attr_names = set(attribute_df["name"]) - set(main_data_df["name"])
         if missing_attr_names:
             _emit_exception(
                 exception=ValueError,
@@ -660,7 +665,7 @@ class NBody6OutputLoader:
             )
 
         # convert T_eff, L, R, F to log scale
-        main_df.rename(
+        main_data_df.rename(
             columns={
                 # effective temperature in Kelvin
                 "tempe": "log_T_eff",
@@ -671,36 +676,35 @@ class NBody6OutputLoader:
             },
             inplace=True,
         )
-        main_df["T_eff"] = np.power(10, main_df["log_T_eff"])
-        main_df["L_sol"] = np.power(10, main_df["log_L_sol"])
-        main_df["R_sol"] = np.power(10, main_df["log_R_sol"])
+        main_data_df["T_eff"] = np.power(10, main_data_df["log_T_eff"])
+        main_data_df["L_sol"] = np.power(10, main_data_df["log_L_sol"])
+        main_data_df["R_sol"] = np.power(10, main_data_df["log_R_sol"])
         # flux in L_sun / R_sun^2
-        main_df["F_sol"] = main_df["L_sol"] / main_df["R_sol"] ** 2
-        main_df["log_F_sol"] = np.log10(main_df["F_sol"])
+        main_data_df["F_sol"] = main_data_df["L_sol"] / main_data_df["R_sol"] ** 2
+        main_data_df["log_F_sol"] = np.log10(main_data_df["F_sol"])
 
-        pair_df = self._merge_build_binary_pair_df(
-            timestamp,
+        binary_pair_df = _build_binary_pair_df(
             out9_snapshot,
             fort19_snapshot,
-            reg_bin_map,
-            mass_map,
-            main_df.set_index("name")[self._DENSITY_CENTER_DIST_KEYS].to_dict(
+            regularized_binary_map,
+            star_mass_map,
+            main_data_df.set_index("name")[_DENSITY_CENTER_DIST_KEYS].to_dict(
                 orient="index"
             ),
         )
 
-        main_df["is_binary"] = main_df["name"].isin(
-            set(pair_df[["name1", "name2"]].values.flatten())
+        main_data_df["is_binary"] = main_data_df["name"].isin(
+            set(binary_pair_df[["name1", "name2"]].values.flatten())
         )
 
         return NBody6Snapshot(
             header=header_dict,
-            data=main_df.sort_values(by="name").reset_index(drop=True)[
+            data=main_data_df.sort_values(by="name").reset_index(drop=True)[
                 [
                     "name",
-                    *self._POS_VEL_KEYS,
+                    *_POS_VEL_KEYS,
                     "mass",
-                    *self._DENSITY_CENTER_DIST_KEYS,
+                    *_DENSITY_CENTER_DIST_KEYS,
                     "T_eff",
                     "log_T_eff",
                     "log_L_sol",
@@ -709,8 +713,8 @@ class NBody6OutputLoader:
                     "is_binary",
                 ]
             ],
-            binary_pair=pair_df.sort_values(by="name1").reset_index(drop=True)[
-                self._BINARY_PAIR_KEYS + self._BINARY_ATTR_KEYS
+            binary_pair=binary_pair_df.sort_values(by="name1").reset_index(drop=True)[
+                _BINARY_PAIR_KEYS
             ],
             raw_snapshot_dict={
                 "densCentre.txt": density_info_snapshot,
