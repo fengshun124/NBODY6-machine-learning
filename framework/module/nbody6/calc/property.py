@@ -1,5 +1,5 @@
 import numpy as np
-from astropy.constants import L_sun, R_sun, sigma_sb
+from astropy.constants import L_bol0, L_sun, R_sun, sigma_sb
 
 
 def calc_effective_temperature(L_sol: float, R_sol: float) -> float:
@@ -50,3 +50,17 @@ def calc_log_surface_flux(log_T_eff: float, log_T_sun: float = np.log10(5772)) -
     :return: Logarithm (base 10) of surface flux in solar surface flux units.
     """
     return 4 * (np.asarray(log_T_eff) - log_T_sun)
+
+
+def calc_bolometric_magnitude(log_L_sol: float) -> float:
+    """
+    Calculate the bolometric magnitude of a star given its luminosity in solar units in logarithmic scale (base 10).
+    The bolometric magnitude is defined as
+    :math:`M_{bol} = M_{bol,\odot} - 2.5 \log_{10}(L_\star / L_{\odot})`,
+    where `M_{bol,\odot}` is the bolometric magnitude of the Sun (-2.5 * log10(L_sun / L_bol0) \approx 4.74),
+    `L_\star` is the luminosity of the star, and `L_{\odot}` is the luminosity of the Sun.
+
+    :param log_L_sol: Logarithm (base 10) of luminosity in solar luminosities.
+    :return: Bolometric magnitude (float).
+    """
+    return -2.5 * (log_L_sol + np.log10(L_sun / L_bol0))

@@ -12,7 +12,8 @@ from module.nbody6.calc.binary import (
     calc_photocentric,
     calc_total_mass,
 )
-from module.nbody6.calc.misc import (
+from module.nbody6.calc.property import (
+    calc_bolometric_magnitude,
     calc_log_effective_temperature,
     calc_log_surface_flux,
 )
@@ -76,13 +77,16 @@ class NBody6SnapshotCollector:
 
                 obs_snapshot_dict[timestamp] = self._build_observed_snapshot(
                     snapshot=self._loader.snapshot_dict[timestamp],
-                    semi_threshold=0.6 * dist_pc,
+                    dist_pc=dist_pc,
                 )
             snapshots_by_dist[dist_pc] = obs_snapshot_dict
 
         return snapshots_by_dist
 
-    def _build_observed_snapshot(self, snapshot: NBody6Snapshot, semi_threshold: float):
+    def _build_observed_snapshot(self, snapshot: NBody6Snapshot, dist_pc: float):
+        # resolvable semi-major axis threshold in AU
+        semi_threshold = 0.6 * dist_pc
+
         header_dict = snapshot.header
         main_df = snapshot.data
         pair_df = snapshot.binary_pair
@@ -208,22 +212,24 @@ class NBody6SnapshotCollector:
             .rename(columns={"index": "name"})
         )
 
-        return (
-            pd.concat(
-                [
-                    single_star_df,
-                    resolved_binary_df,
-                    merged_unresolved_binary_df,
-                ],
-                ignore_index=True,
-            )
-            .sort_values(
-                by="name",
-                key=lambda s: s.map(
-                    lambda x: (0, int(x))
-                    if isinstance(x, int)
-                    else (1, int(re.search(r"\d+", str(x)).group()))
-                ),
-            )
-            .reset_index(drop=True)
+        obs_df = pd.concat(
+            [
+                single_star_df,
+                resolved_binary_df,
+                merged_unresolved_binary_df,
+            ],
+            ignore_index=True,
         )
+
+        # calculate bolometric (absolute) magnitude
+        obs_df["M_mag"] = calc_bolometric_magnitude(obs_df["log_L_sol"].values)
+        obs_df["m_mag"] = obs_df["M_mag"] + 5 * np.log10(dist_pc / 10)
+
+        return obs_df.sort_values(
+            by="name",
+            key=lambda s: s.map(
+                lambda x: (0, int(x))
+                if isinstance(x, int)
+                else (1, int(re.search(r"\d+", str(x)).group()))
+            ),
+        ).reset_index(drop=True)

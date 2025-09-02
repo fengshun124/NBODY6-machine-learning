@@ -9,6 +9,7 @@ import pandas as pd
 from tqdm.auto import tqdm
 
 from module.nbody6.calc.binary import calc_semi_major_axis
+from module.nbody6.calc.property import calc_log_surface_flux
 from module.nbody6.file.base import NBody6FileParserBase, NBody6FileSnapshot
 from module.nbody6.file.fort19 import NBody6Fort19
 from module.nbody6.file.fort82 import NBody6Fort82
@@ -679,9 +680,8 @@ class NBody6OutputLoader:
         main_data_df["T_eff"] = np.power(10, main_data_df["log_T_eff"])
         main_data_df["L_sol"] = np.power(10, main_data_df["log_L_sol"])
         main_data_df["R_sol"] = np.power(10, main_data_df["log_R_sol"])
-        # flux in L_sun / R_sun^2
-        main_data_df["F_sol"] = main_data_df["L_sol"] / main_data_df["R_sol"] ** 2
-        main_data_df["log_F_sol"] = np.log10(main_data_df["F_sol"])
+        # flux in solar flux units
+        main_data_df["log_F_sol"] = calc_log_surface_flux(main_data_df["log_T_eff"])
 
         binary_pair_df = _build_binary_pair_df(
             out9_snapshot,
