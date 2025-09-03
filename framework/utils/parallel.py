@@ -85,6 +85,7 @@ class ParallelTqdm(Parallel):
                 total=self.total_tasks,
                 disable=self.disable_progressbar,
                 unit="tasks",
+                dynamic_ncols=True,
             )
         # call parent function
         return super().dispatch_one_batch(iterator)
@@ -100,4 +101,3 @@ class ParallelTqdm(Parallel):
             self.progress_bar.refresh()
         # update progressbar
         self.progress_bar.update(self.n_completed_tasks - self.progress_bar.n)
-

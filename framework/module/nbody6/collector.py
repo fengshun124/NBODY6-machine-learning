@@ -39,6 +39,13 @@ class NBody6SnapshotCollector:
         return self._loader.snapshot_dict
 
     @property
+    def summary(self) -> pd.DataFrame:
+        return self._loader.summary
+
+    def summarize(self) -> pd.DataFrame:
+        return self._loader.summarize()
+
+    @property
     def snapshot_dict(self) -> Dict[float, NBody6Snapshot]:
         return self._loader.snapshot_dict
 
@@ -83,7 +90,7 @@ class NBody6SnapshotCollector:
 
         return snapshots_by_dist
 
-    def _build_observed_snapshot(self, snapshot: NBody6Snapshot, dist_pc: float):
+    def _build_observed_snapshot(self, snapshot: NBody6Snapshot, dist_pc: float) -> pd.DataFrame:
         # resolvable semi-major axis threshold in AU
         semi_threshold = 0.6 * dist_pc
 
