@@ -143,20 +143,20 @@ class NBody6SnapshotCollector:
                 rv_kms=sim_offset_spherical.radial_velocity.to(u.km / u.s).value,
             )
 
+        # convert coordinates for all stars
         converted_main_df = _convert_coord_frame(
-            centroid_coord_pc=pseudo_origin,
-            sim_df=main_df,
+            centroid_coord_pc=pseudo_origin, sim_df=main_df
         )
 
         pair_df = snapshot.binary_pair
-        name_attr_map = main_df.set_index("name").to_dict(orient="index")
+        name_attr_map = converted_main_df.set_index("name").to_dict(orient="index")
 
-        # collect single stars
-        single_star_df = main_df[~main_df["is_binary"]].assign(
+        # collect single stars from the converted dataframe
+        single_star_df = converted_main_df[~converted_main_df["is_binary"]].assign(
             is_unresolved_binary=False
         )
 
-        # construct pair distance by mean of obj1/2 distance
+        # construct pair distance using the converted distance
         pair_dist = pair_df.copy().apply(
             lambda row: np.mean(
                 converted_main_df[
@@ -278,6 +278,12 @@ class NBody6SnapshotCollector:
             .T.reset_index()
             .rename(columns={"index": "name"})
         )
+
+        # For unresolved binaries, we need to add the converted coordinates after merging
+        if not merged_unresolved_binary_df.empty:
+            merged_unresolved_binary_df = _convert_coord_frame(
+                centroid_coord_pc=pseudo_origin, sim_df=merged_unresolved_binary_df
+            )
 
         merged_simulated_obs_df = pd.concat(
             [
