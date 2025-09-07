@@ -789,9 +789,9 @@ class NBody6OutputLoader:
 
         simulation_stats_dicts = []
         for timestamp, snapshot in (
-            pbar := tqdm(self._snapshot_dict.items(), leave=False)
-            if is_verbose
-            else self._snapshot_dict.items()
+            pbar := tqdm(
+                self._snapshot_dict.items(), leave=False, disable=not is_verbose
+            )
         ):
             if is_verbose:
                 pbar.set_description(f"Processing Snapshot@{timestamp:.2f} Myr")

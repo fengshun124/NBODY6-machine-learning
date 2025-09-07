@@ -2,8 +2,15 @@ import re
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
+import astropy.units as u
 import numpy as np
 import pandas as pd
+from astropy.coordinates import (
+    CartesianDifferential,
+    CartesianRepresentation,
+    SkyCoord,
+    SkyOffsetFrame,
+)
 from tqdm.auto import tqdm
 
 from module.nbody6.calc.binary import (
@@ -51,7 +58,7 @@ class NBody6SnapshotCollector:
 
     def build_observed_snapshot(
         self, distance_pc: Union[int, List[int]], is_verbose: bool = False
-    ) -> Dict[int, Dict[float, pd.DataFrame]]:
+    ) -> Dict[int, Dict[float, List[pd.DataFrame]]]:
         distance_pc = (
             sorted(set(distance_pc))
             if not isinstance(distance_pc, (int, float))
@@ -84,20 +91,64 @@ class NBody6SnapshotCollector:
 
                 obs_snapshot_dict[timestamp] = self._build_observed_snapshot(
                     snapshot=self._loader.snapshot_dict[timestamp],
-                    dist_pc=dist_pc,
+                    pseudo_origin=(dist_pc, 0.0, 0.0),
                 )
             snapshots_by_dist[dist_pc] = obs_snapshot_dict
 
         return snapshots_by_dist
 
-    def _build_observed_snapshot(self, snapshot: NBody6Snapshot, dist_pc: float) -> pd.DataFrame:
-        # resolvable semi-major axis threshold in AU
-        semi_threshold = 0.6 * dist_pc
-
+    def _build_observed_snapshot(
+        self, snapshot: NBody6Snapshot, pseudo_origin: Tuple[float, float, float]
+    ) -> pd.DataFrame:
         header_dict = snapshot.header
         main_df = snapshot.data
-        pair_df = snapshot.binary_pair
 
+        def _convert_coord_frame(
+            centroid_coord_pc: Tuple[float, float, float], sim_df: pd.DataFrame
+        ) -> pd.DataFrame:
+            sim_world_cartesian = SkyCoord(
+                CartesianRepresentation(
+                    x=np.asarray(centroid_coord_pc[0] + sim_df["x"].values) * u.pc,
+                    y=np.asarray(centroid_coord_pc[1] + sim_df["y"].values) * u.pc,
+                    z=np.asarray(centroid_coord_pc[2] + sim_df["z"].values) * u.pc,
+                ).with_differentials(
+                    CartesianDifferential(
+                        d_x=sim_df["vx"].values * u.km / u.s,
+                        d_y=sim_df["vy"].values * u.km / u.s,
+                        d_z=sim_df["vz"].values * u.km / u.s,
+                    )
+                ),
+                frame="galactic",
+            )
+
+            pseudo_origin = SkyCoord(
+                CartesianRepresentation(
+                    x=centroid_coord_pc[0] * u.pc,
+                    y=centroid_coord_pc[1] * u.pc,
+                    z=centroid_coord_pc[2] * u.pc,
+                ),
+                frame="galactic",
+            )
+            sim_offset_spherical = sim_world_cartesian.transform_to(
+                SkyOffsetFrame(origin=pseudo_origin)
+            )
+            return sim_df.copy().assign(
+                lon_deg=sim_offset_spherical.lon.deg,
+                lat_deg=sim_offset_spherical.lat.deg,
+                pm_lon_coslat_mas_yr=sim_offset_spherical.pm_lon_coslat.to(
+                    u.mas / u.yr
+                ).value,
+                pm_lat_mas_yr=sim_offset_spherical.pm_lat.to(u.mas / u.yr).value,
+                dist_pc=sim_offset_spherical.distance.pc,
+                rv_kms=sim_offset_spherical.radial_velocity.to(u.km / u.s).value,
+            )
+
+        converted_main_df = _convert_coord_frame(
+            centroid_coord_pc=pseudo_origin,
+            sim_df=main_df,
+        )
+
+        pair_df = snapshot.binary_pair
         name_attr_map = main_df.set_index("name").to_dict(orient="index")
 
         # collect single stars
@@ -105,10 +156,19 @@ class NBody6SnapshotCollector:
             is_unresolved_binary=False
         )
 
+        # construct pair distance by mean of obj1/2 distance
+        pair_dist = pair_df.copy().apply(
+            lambda row: np.mean(
+                converted_main_df[
+                    converted_main_df["name"].isin(row[["obj1_ids", "obj2_ids"]].sum())
+                ]["dist_pc"].values
+            ),
+            axis=1,
+        )
         # collect resolved binaries and unresolved binaries
-        resolved_pair_df = pair_df[pair_df["semi"] >= semi_threshold]
-        resolved_binary_df = main_df[
-            main_df["name"].isin(
+        resolved_pair_df = pair_df[pair_dist * 0.6 >= pair_df["semi"]]
+        resolved_binary_df = converted_main_df[
+            converted_main_df["name"].isin(
                 resolved_pair_df[["obj1_ids", "obj2_ids"]].sum(axis=1).sum()
             )
         ].assign(is_unresolved_binary=False)
@@ -219,7 +279,7 @@ class NBody6SnapshotCollector:
             .rename(columns={"index": "name"})
         )
 
-        obs_df = pd.concat(
+        merged_simulated_obs_df = pd.concat(
             [
                 single_star_df,
                 resolved_binary_df,
@@ -228,11 +288,14 @@ class NBody6SnapshotCollector:
             ignore_index=True,
         )
 
-        # calculate bolometric (absolute) magnitude
-        obs_df["M_mag"] = calc_bolometric_magnitude(obs_df["log_L_sol"].values)
-        obs_df["m_mag"] = obs_df["M_mag"] + 5 * np.log10(dist_pc / 10)
+        merged_simulated_obs_df["M_mag"] = calc_bolometric_magnitude(
+            merged_simulated_obs_df["log_L_sol"].values
+        )
+        merged_simulated_obs_df["m_mag"] = merged_simulated_obs_df[
+            "M_mag"
+        ] + 5 * np.log10(merged_simulated_obs_df["dist_pc"] / 10)
 
-        return obs_df.sort_values(
+        return merged_simulated_obs_df.sort_values(
             by="name",
             key=lambda s: s.map(
                 lambda x: (0, int(x))
