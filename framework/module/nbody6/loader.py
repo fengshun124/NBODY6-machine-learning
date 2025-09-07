@@ -504,14 +504,27 @@ class NBody6OutputLoader:
                 )
                 if not o9_snapshot.data.empty
                 else pd.DataFrame(
-                    columns=["name1", "name2", "mass1", "mass2", "pair"]
-                    + self._BINARY_ATTR_KEYS
+                    columns=[
+                        "name1",
+                        "name2",
+                        "mass1",
+                        "mass2",
+                        "pair",
+                    ]
+                    + _BINARY_ATTR_KEYS
                 )
             )
 
             non_reg_bin_pair_df = (
                 f19_snapshot.data.copy()[
-                    ["name1", "name2", "mass1", "mass2", "ecc", "p"]
+                    [
+                        "name1",
+                        "name2",
+                        "mass1",
+                        "mass2",
+                        "ecc",
+                        "p",
+                    ]
                 ]
                 .assign(
                     pair=lambda df: df.apply(
@@ -532,8 +545,16 @@ class NBody6OutputLoader:
                 .rename(columns={"p": "log_period_days"})
                 if not f19_snapshot.data.empty
                 else pd.DataFrame(
-                    columns=["name1", "name2", "mass1", "mass2", "pair"]
-                    + self._BINARY_ATTR_KEYS
+                    columns=[
+                        "name1",
+                        "name2",
+                        "mass1",
+                        "mass2",
+                        "kstar1",
+                        "kstar2",
+                        "pair",
+                    ]
+                    + _BINARY_ATTR_KEYS
                 )
             )
 
@@ -559,6 +580,14 @@ class NBody6OutputLoader:
                     )
                     pair_df = pair_df.drop_duplicates(subset=["pair"], keep="first")
 
+                def _lookup_r_dc_map(ids: List[int], field: str) -> float:
+                    return (
+                        np.mean([r_dc_map[i][field] for i in ids])
+                        if ids
+                        and all(i in r_dc_map and field in r_dc_map[i] for i in ids)
+                        else np.nan
+                    )
+
                 pair_df = (
                     pair_df.assign(
                         obj1_ids=pair_df["name1"].map(
@@ -583,20 +612,56 @@ class NBody6OutputLoader:
                     .assign(
                         obj1_total_mass=lambda df: df["obj1_mass"].map(np.sum),
                         obj2_total_mass=lambda df: df["obj2_mass"].map(np.sum),
-                        obj1_r_dc=lambda df: df["name1"].map(
-                            lambda n: r_dc_map.get(n, {}).get("r_dc", np.nan)
+                        obj1_r_dc=lambda df: df["obj1_ids"].map(
+                            lambda ids: _lookup_r_dc_map(ids, "r_dc")
                         ),
-                        obj2_r_dc=lambda df: df["name2"].map(
-                            lambda n: r_dc_map.get(n, {}).get("r_dc", np.nan)
+                        obj2_r_dc=lambda df: df["obj2_ids"].map(
+                            lambda ids: _lookup_r_dc_map(ids, "r_dc")
                         ),
-                        obj1_r_dc_r_tidal=lambda df: df["name1"].map(
-                            lambda n: r_dc_map.get(n, {}).get("r_dc_r_tidal", np.nan)
+                        obj1_r_dc_r_tidal=lambda df: df["obj1_ids"].map(
+                            lambda ids: _lookup_r_dc_map(ids, "r_dc_r_tidal")
                         ),
-                        obj2_r_dc_r_tidal=lambda df: df["name2"].map(
-                            lambda n: r_dc_map.get(n, {}).get("r_dc_r_tidal", np.nan)
+                        obj2_r_dc_r_tidal=lambda df: df["obj2_ids"].map(
+                            lambda ids: _lookup_r_dc_map(ids, "r_dc_r_tidal")
                         ),
                     )
                 )
+
+            invalid_mask = (
+                pair_df[
+                    [
+                        "obj1_total_mass",
+                        "obj2_total_mass",
+                        "obj1_r_dc",
+                        "obj2_r_dc",
+                        "obj1_r_dc_r_tidal",
+                        "obj2_r_dc_r_tidal",
+                    ]
+                ]
+                .isna()
+                .any(axis=1)
+                | pair_df["obj1_mass"].map(
+                    lambda v: not (isinstance(v, list) and all(pd.notna(v)))
+                )
+                | pair_df["obj2_mass"].map(
+                    lambda v: not (isinstance(v, list) and all(pd.notna(v)))
+                )
+            )
+
+            if invalid_mask.any():
+                bad_pairs = pair_df.loc[invalid_mask, "pair"].tolist()
+                bad_pairs_str = ", ".join(map(str, bad_pairs))
+                _emit_exception(
+                    ValueError,
+                    message=(
+                        f"Binary pair(s) with incomplete fields at {timestamp:.2f} Myr: "
+                        f"{bad_pairs_str}."
+                    ),
+                    note="Dropping affected rows.",
+                    is_strict=is_strict,
+                )
+                if not is_strict:
+                    pair_df = pair_df.loc[~invalid_mask].reset_index(drop=True)
 
             return pair_df.reset_index(drop=True)
 

@@ -46,19 +46,19 @@ class NBody6SnapshotCollector:
         return self._loader.snapshot_dict
 
     @property
-    def summary(self) -> pd.DataFrame:
+    def summary(self) -> Optional[pd.DataFrame]:
         return self._loader.summary
 
-    def summarize(self) -> pd.DataFrame:
+    def summarize(self) -> Optional[pd.DataFrame]:
         return self._loader.summarize()
 
     @property
-    def snapshot_dict(self) -> Dict[float, NBody6Snapshot]:
+    def snapshot_dict(self) -> Optional[Dict[float, NBody6Snapshot]]:
         return self._loader.snapshot_dict
 
     def build_observed_snapshot(
         self, distance_pc: Union[int, List[int]], is_verbose: bool = False
-    ) -> Dict[int, Dict[float, List[pd.DataFrame]]]:
+    ) -> Dict[int, Dict[float, pd.DataFrame]]:
         distance_pc = (
             sorted(set(distance_pc))
             if not isinstance(distance_pc, (int, float))
