@@ -43,17 +43,25 @@ class SnapshotCollector:
             raise FileNotFoundError(f"Data file not found: {filepath}")
 
         raw_data = joblib.load(filepath)
-        snapshots = [
-            {"header": {"pseudo_coord": coord, **snapshot["header"]}, "stars": stars_df}
-            for coord, series in raw_data.items()
-            for timestamp, snapshot in series.items()
-            if len(
-                stars_df := pd.DataFrame(snapshot["stars"])
-                .query("is_within_2x_r_tidal")
-                .reset_index(drop=True)
-            )
-            >= min_stars
-        ]
+        snapshots = []
+        for coord, series in raw_data.items():
+            for timestamp, snapshot in series.items():
+                stars_df = pd.DataFrame(snapshot["stars"])
+
+                # Optimization: Use boolean indexing instead of .query() for better performance
+                if "is_within_2x_r_tidal" in stars_df.columns:
+                    stars_df = stars_df[stars_df["is_within_2x_r_tidal"]]
+
+                stars_df = stars_df.reset_index(drop=True)
+
+                if len(stars_df) >= min_stars:
+                    snapshots.append(
+                        {
+                            "header": {"pseudo_coord": coord, **snapshot["header"]},
+                            "stars": stars_df,
+                        }
+                    )
+
         instance = cls(snapshots=snapshots)
         instance._data_filepath = str(filepath)
         return instance
@@ -63,7 +71,7 @@ class SnapshotCollector:
         feature_keys: List[str],
         target_keys: List[str],
         n_sample_per_snapshot: int = 16,
-        n_star_per_snapshot: int = 128,
+        n_star_per_sample: int = 128,
         drop_ratio_range: tuple = (0.15, 0.25),
         drop_probability: float = 0.2,
         seed: int = 42,
@@ -82,39 +90,48 @@ class SnapshotCollector:
 
             targets = np.array([header_dict[k] for k in target_keys], dtype=np.float32)
 
+            if not all(k in star_df.columns for k in feature_keys):
+                missing = [k for k in feature_keys if k not in star_df.columns]
+                raise KeyError(f"Missing feature keys in stars dataframe: {missing}")
+
+            full_features = star_df[feature_keys].to_numpy(dtype=np.float32)
+
             for sample_idx in range(n_sample_per_snapshot):
                 rng = np.random.default_rng(snapshot_idx * 100 + sample_idx * 10 + seed)
+
                 # sample snapshots with sufficient stars
-                if n_stars >= n_star_per_snapshot:
-                    sampled_df = star_df.sample(
-                        n=n_star_per_snapshot, replace=False, random_state=rng
-                    ).reset_index(drop=True)
-                    valid_mask = np.ones(n_star_per_snapshot, dtype=bool)
+                if n_stars >= n_star_per_sample:
+                    indices = rng.choice(
+                        n_stars, size=n_star_per_sample, replace=False
+                    )
+                    features = full_features[indices]
+                    valid_mask = np.ones(n_star_per_sample, dtype=bool)
+
                     # randomly drop some stars to simulate snapshots with insufficient stars
                     if rng.random() < drop_probability:
                         n_drop = int(
-                            n_star_per_snapshot * rng.uniform(*drop_ratio_range)
+                            n_star_per_sample * rng.uniform(*drop_ratio_range)
                         )
-                        valid_mask[
-                            rng.choice(n_star_per_snapshot, size=n_drop, replace=False)
-                        ] = False
+                        drop_indices = rng.choice(
+                            n_star_per_sample, size=n_drop, replace=False
+                        )
+                        valid_mask[drop_indices] = False
                 # pad snapshots with insufficient stars
                 else:
-                    s = star_df.sample(n=n_stars, replace=False, random_state=rng)
-                    n_pad = n_star_per_snapshot - n_stars
-                    sampled_df = pd.concat(
-                        [
-                            s,
-                            pd.DataFrame({col: [0] * n_pad for col in star_df.columns}),
-                        ],
-                        ignore_index=True,
+                    features = np.zeros(
+                        (n_star_per_sample, len(feature_keys)), dtype=np.float32
                     )
-                    valid_mask = np.array([True] * n_stars + [False] * n_pad)
+                    valid_mask = np.zeros(n_star_per_sample, dtype=bool)
+
+                    # shuffle and fill existing stars
+                    indices = rng.permutation(n_stars)
+                    features[:n_stars] = full_features[indices]
+                    valid_mask[:n_stars] = True
 
                 yield {
-                    "features": sampled_df[feature_keys].to_numpy(dtype=np.float32),
+                    "features": features,
                     "feature_keys": feature_keys_arr,
-                    "valid_mask": np.asarray(valid_mask, dtype=bool),
+                    "valid_mask": valid_mask,
                     "targets": targets,
                     "target_keys": target_keys_arr,
                 }
@@ -132,7 +149,7 @@ class SnapshotCollector:
         return list(
             self.sample_iter(
                 n_sample_per_snapshot=n_sample_per_snapshot,
-                n_star_per_snapshot=n_star_per_snapshot,
+                n_star_per_sample=n_star_per_snapshot,
                 feature_keys=feature_keys,
                 target_keys=target_keys,
                 drop_ratio_range=drop_ratio_range,
