@@ -1,6 +1,7 @@
 archive
 data
 output
+cache
 
 ### VisualStudioCode template
 .vscode/*

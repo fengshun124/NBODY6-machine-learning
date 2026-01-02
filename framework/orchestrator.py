@@ -5,7 +5,7 @@ import torch
 import torchmetrics
 from torch import nn
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset
 
 
 class LightningRegressionOrchestrator(pl.LightningModule):
@@ -115,6 +115,7 @@ class LightningRegressionOrchestrator(pl.LightningModule):
             },
         }
 
+
 # FOR TESTING PURPOSES ONLY!!!
 class ToySetDataset(Dataset):
     def __init__(
@@ -144,7 +145,7 @@ class ToySetDataset(Dataset):
             valid_elements = self.data[i, : self.set_sizes[i], 0]
             self.targets[i] = valid_elements.mean() * 10.0 + 5.0
 
-        # Store normalization parameters or compute from this dataset
+        # store normalization parameters or compute from this dataset
         if y_mean is not None and y_std is not None:
             self.y_mean = y_mean
             self.y_std = y_std
@@ -186,7 +187,7 @@ class ToySetDataModule(pl.LightningDataModule):
         self.seed = seed
 
     def setup(self, stage: Optional[str] = None) -> None:
-        # Calculate split sizes
+        # calculate split sizes
         train_len = int(self.num_samples * self.split[0])
         val_len = int(self.num_samples * self.split[1])
         test_len = self.num_samples - train_len - val_len
@@ -291,19 +292,31 @@ if __name__ == "__main__":
     )
 
     # train and test model
+    version_str = "toy-set_transformer"
     trainer = pl.Trainer(
         accelerator="auto",
         log_every_n_steps=10,
         max_epochs=300,
         deterministic=True,
-        logger=CSVLogger(save_dir="/tmp", name="lightning_logs"),
+        logger=CSVLogger(
+            save_dir="/tmp",
+            name="logs",
+            version=version_str,
+        ),
         callbacks=[
+            pl.callbacks.ModelCheckpoint(
+                dirpath="/tmp/checkpoints",
+                filename=f"{version_str}-{{epoch:03d}}-{{val_huber_loss:.4e}}",
+                monitor="val_huber_loss",
+                mode="min",
+                save_top_k=1,
+            ),
             pl.callbacks.EarlyStopping(
                 monitor="val_huber_loss",
                 patience=5,
                 mode="min",
                 strict=True,
-            )
+            ),
         ],
     )
     trainer.fit(orchestrator, datamodule=toy_data_module)
