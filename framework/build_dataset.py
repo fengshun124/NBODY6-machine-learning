@@ -314,7 +314,7 @@ def normalize(
         # extract columns: shape (n_samples, len(columns))
         subset = train_targets[:, col_indices]
         norm.fit(subset)
-        logger.info(f"[normalize]   Fitted: {norm}")
+        logger.info(f"[normalize] - Fitted: {norm}")
 
     del train_features, train_targets
 
@@ -430,6 +430,10 @@ def build_dataset(
         "drop_probability": drop_probability,
         "drop_ratio_range": drop_ratio_range,
         "seed": seed,
+        "manifest_summary": {
+            split: hashlib.sha256(",".join(sorted(run_ids)).encode()).hexdigest()[:12]
+            for split, run_ids in manifests.items()
+        },
     }
     cfg_hash = hashlib.sha256(
         json.dumps(cfg_dict, sort_keys=True).encode()
@@ -441,8 +445,11 @@ def build_dataset(
     cache_root = (export_path / f"{cfg_hash}").resolve()
     cache_root.mkdir(parents=True, exist_ok=True)
 
-    with (cache_root / "config.json").open("w") as f:
-        json.dump(cfg_dict, f, indent=2)
+    # save both configuration and full manifest
+    meta_dict = ({**cfg_dict, "manifests": manifests},)
+    with (cache_root / "meta.json").open("w") as f:
+        json.dump(meta_dict, f, indent=2)
+    logger.info(f"Saved dataset configuration to {cache_root / 'meta.json'}")
 
     splits = list(manifests.keys())
 
