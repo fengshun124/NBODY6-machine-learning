@@ -1,5 +1,5 @@
 import warnings
-from typing import Any, Dict, Literal, Tuple
+from typing import Any, Dict, Literal, Sequence, Tuple
 
 import joblib
 import numpy as np
@@ -38,8 +38,8 @@ SUPPORTED_METHODS = frozenset(
 
 
 class Normalizer:
-    def __init__(self, columns: Tuple[str], method: NormMethod) -> None:
-        self._columns = columns
+    def __init__(self, columns: Sequence[str], method: NormMethod) -> None:
+        self._columns = tuple(columns)
         # enforce lowercase for method
         self._method = method.lower()
         self._is_fitted = False
@@ -74,7 +74,7 @@ class Normalizer:
                     [
                         (
                             "log",
-                            FunctionTransformer(np.log1p, np.expm1, validate="auto"),
+                            FunctionTransformer(np.log1p, np.expm1, validate=True),
                         ),
                         ("scale", StandardScaler()),
                     ]
@@ -84,7 +84,7 @@ class Normalizer:
                     [
                         (
                             "log",
-                            FunctionTransformer(np.log1p, np.expm1, validate="auto"),
+                            FunctionTransformer(np.log1p, np.expm1, validate=True),
                         ),
                         ("scale", MinMaxScaler()),
                     ]
@@ -101,7 +101,7 @@ class Normalizer:
                     "No transformation will be applied."
                 )
                 return FunctionTransformer(
-                    func=lambda x: x, inverse_func=lambda x: x, validate="auto"
+                    func=lambda x: x, inverse_func=lambda x: x, validate=True
                 )
 
     def fit(self, data: np.ndarray) -> "Normalizer":

@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Dict, Generator, List, Optional, Union
+from typing import Dict, Generator, List, Optional, Sequence, Union
 
 import joblib
 import numpy as np
@@ -68,16 +68,23 @@ class SnapshotCollector:
 
     def sample_iter(
         self,
-        feature_keys: List[str],
-        target_keys: List[str],
+        feature_keys: Sequence[str],
+        target_keys: Sequence[str],
         n_sample_per_snapshot: int = 16,
         n_star_per_sample: int = 128,
         drop_ratio_range: tuple = (0.15, 0.25),
         drop_probability: float = 0.2,
         seed: int = 42,
     ) -> Generator[Dict[str, np.ndarray], None, None]:
-        feature_keys_arr = np.array(feature_keys, dtype="<U64")
-        target_keys_arr = np.array(target_keys, dtype="<U64")
+        if isinstance(feature_keys, str) or isinstance(target_keys, str):
+            raise TypeError(
+                "Expected feature_keys and target_keys to be sequences of strings, "
+                f"got type(feature_keys)={type(feature_keys)}, "
+                f"type(target_keys)={type(target_keys)} instead."
+            )
+
+        feature_keys_arr = np.array(tuple(feature_keys), dtype="<U64")
+        target_keys_arr = np.array(tuple(target_keys), dtype="<U64")
 
         for snapshot_idx, snapshot in enumerate(self.snapshots):
             star_df = snapshot["stars"]
@@ -97,21 +104,18 @@ class SnapshotCollector:
             full_features = star_df[feature_keys].to_numpy(dtype=np.float32)
 
             for sample_idx in range(n_sample_per_snapshot):
-                rng = np.random.default_rng(snapshot_idx * 100 + sample_idx * 10 + seed)
+                ss = np.random.SeedSequence([seed, snapshot_idx, sample_idx])
+                rng = np.random.default_rng(ss)
 
                 # sample snapshots with sufficient stars
                 if n_stars >= n_star_per_sample:
-                    indices = rng.choice(
-                        n_stars, size=n_star_per_sample, replace=False
-                    )
+                    indices = rng.choice(n_stars, size=n_star_per_sample, replace=False)
                     features = full_features[indices]
                     valid_mask = np.ones(n_star_per_sample, dtype=bool)
 
                     # randomly drop some stars to simulate snapshots with insufficient stars
                     if rng.random() < drop_probability:
-                        n_drop = int(
-                            n_star_per_sample * rng.uniform(*drop_ratio_range)
-                        )
+                        n_drop = int(n_star_per_sample * rng.uniform(*drop_ratio_range))
                         drop_indices = rng.choice(
                             n_star_per_sample, size=n_drop, replace=False
                         )
@@ -138,10 +142,10 @@ class SnapshotCollector:
 
     def sample(
         self,
+        feature_keys: Sequence[str],
+        target_keys: Sequence[str],
         n_sample_per_snapshot: int = 16,
-        n_star_per_snapshot: int = 128,
-        feature_keys: Optional[List[str]] = None,
-        target_keys: Optional[List[str]] = None,
+        n_star_per_sample: int = 128,
         drop_ratio_range: tuple = (0.15, 0.25),
         drop_probability: float = 0.2,
         seed: int = 42,
@@ -149,7 +153,7 @@ class SnapshotCollector:
         return list(
             self.sample_iter(
                 n_sample_per_snapshot=n_sample_per_snapshot,
-                n_star_per_sample=n_star_per_snapshot,
+                n_star_per_sample=n_star_per_sample,
                 feature_keys=feature_keys,
                 target_keys=target_keys,
                 drop_ratio_range=drop_ratio_range,
@@ -176,7 +180,7 @@ if __name__ == "__main__":
 
     sampled_data = collector.sample(
         n_sample_per_snapshot=4,
-        n_star_per_snapshot=10,
+        n_star_per_sample=10,
         feature_keys=[
             "x",
             "y",
