@@ -5,9 +5,8 @@ import joblib
 import numpy as np
 import pytorch_lightning as pl
 import torch
-from torch.utils.data import DataLoader, Dataset
-
 from dataset.normalizer import Normalizer
+from torch.utils.data import DataLoader, Dataset
 
 
 class NBody6Dataset(Dataset):
@@ -143,13 +142,10 @@ class NBody6DataModule(pl.LightningDataModule):
         self._feature_indices: Optional[List[int]] = None
         if feature_keys is not None:
             self._feature_indices = self._get_feature_indices(feature_keys)
-            print(f"Selected features: {feature_keys}")
-            print(f"Feature indices: {self._feature_indices}")
 
         # convert target name to index if provided
         if target_key is not None:
             self._target_idx = self._get_target_index(target_key)
-            print(f"Selected target: {target_key} (index: {self._target_idx})")
 
         # will be populated in setup()
         self._train_ds: Optional[NBody6Dataset] = None

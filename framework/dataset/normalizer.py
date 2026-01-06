@@ -96,10 +96,11 @@ class Normalizer:
                     output_distribution="normal", random_state=42
                 )
             case _:
-                warnings.warn(
-                    f"Unknown normalization method '{self._method}'. "
-                    "No transformation will be applied."
-                )
+                if self._method != "none":
+                    warnings.warn(
+                        f"Unknown normalization method '{self._method}'. "
+                        "No transformation will be applied."
+                    )
                 return FunctionTransformer(
                     func=lambda x: x, inverse_func=lambda x: x, validate=True
                 )
