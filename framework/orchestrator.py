@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional, Tuple, Type, Union
+from typing import Any, Type
 
 import pytorch_lightning as pl
 import torch
@@ -11,12 +11,12 @@ from torch.utils.data import DataLoader, Dataset
 class LightningRegressionOrchestrator(pl.LightningModule):
     def __init__(
         self,
-        regressor: Union[nn.Module, Type[nn.Module]],
-        hyperparameters: Dict[str, Any],
+        regressor: nn.Module | Type[nn.Module],
+        hyperparameters: dict[str, Any],
         huber_delta: float = 1.0,
         learning_rate: float = 1e-3,
         weight_decay: float = 1e-4,
-        seed: Optional[int] = None,
+        seed: int = 42,
     ) -> None:
         super().__init__()
 
@@ -46,13 +46,13 @@ class LightningRegressionOrchestrator(pl.LightningModule):
         self.test_mse = torchmetrics.MeanSquaredError()
 
     def forward(
-        self, X: torch.Tensor, mask: Optional[torch.Tensor] = None
+        self, X: torch.Tensor, mask: torch.Tensor | None = None
     ) -> torch.Tensor:
         return self.model(X, mask)
 
     def _evaluation(
         self, batch, stage: str
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         inputs, targets, mask = batch
         mask = mask.bool()
 
@@ -64,9 +64,10 @@ class LightningRegressionOrchestrator(pl.LightningModule):
         self.log(
             f"{stage}_huber_loss",
             loss,
-            on_step=(stage == "train"),
+            on_step=False,
             on_epoch=True,
             prog_bar=True,
+            sync_dist=True,
         )
 
         for metric_key in ["mae", "mse"]:
@@ -78,6 +79,7 @@ class LightningRegressionOrchestrator(pl.LightningModule):
                 on_step=False,
                 on_epoch=True,
                 prog_bar=True,
+                sync_dist=True,
             )
 
         return loss
@@ -91,7 +93,7 @@ class LightningRegressionOrchestrator(pl.LightningModule):
     def test_step(self, batch, batch_idx) -> None:
         self._evaluation(batch=batch, stage="test")
 
-    def configure_optimizers(self) -> Dict[str, Any]:
+    def configure_optimizers(self) -> dict[str, Any]:
         optimizer = torch.optim.AdamW(
             params=self.parameters(),
             lr=self.hparams.learning_rate,
@@ -123,8 +125,8 @@ class ToySetDataset(Dataset):
         num_samples: int = 1000,
         max_set_size: int = 60,
         input_dim: int = 6,
-        y_mean: Optional[float] = None,
-        y_std: Optional[float] = None,
+        y_mean: float | None = None,
+        y_std: float | None = None,
     ) -> None:
         self.num_samples = num_samples
         self.max_set_size = max_set_size
@@ -162,7 +164,7 @@ class ToySetDataset(Dataset):
     def __len__(self) -> int:
         return self.num_samples
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.data[idx], self.norm_targets[idx], self.masks[idx]
 
 
@@ -173,9 +175,9 @@ class ToySetDataModule(pl.LightningDataModule):
         max_set_size: int = 96,
         input_dim: int = 6,
         batch_size: int = 32,
-        train_val_test_split: Tuple[float, float, float] = (0.7, 0.2, 0.1),
+        train_val_test_split: tuple[float, float, float] = (0.7, 0.2, 0.1),
         num_workers: int = 4,
-        seed: Optional[int] = None,
+        seed: int = 42,
     ):
         super().__init__()
         self.num_samples = num_samples
@@ -186,7 +188,7 @@ class ToySetDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.seed = seed
 
-    def setup(self, stage: Optional[str] = None) -> None:
+    def setup(self, stage: str | None = None) -> None:
         # calculate split sizes
         train_len = int(self.num_samples * self.split[0])
         val_len = int(self.num_samples * self.split[1])

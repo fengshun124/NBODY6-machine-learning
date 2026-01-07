@@ -1,5 +1,3 @@
-from typing import Optional, Tuple
-
 import torch
 from torch import nn
 
@@ -8,29 +6,28 @@ class SummaryStatsRegressor(nn.Module):
     def __init__(
         self,
         input_dim: int,
-        output_dim: int,
-        hidden_dims: Tuple[int] = (16, 4),
+        output_dim: int = 1,
+        hidden_dims: int | list[int] | tuple[int, ...] = (16, 4),
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
-        self.input_dim = int(input_dim)
+        self.input_dim = input_dim
 
         # count (1) + per-feature statistics (7 * input_dim):
         # mean, median, min, max, std, 25th percentile, 75th percentile
-        self.feat_dims = int(self.input_dim * 7 + 1)
+        self.feat_dims = input_dim * 7 + 1
 
-        # MLP layers
-        layer_dims = [self.feat_dims] + list(hidden_dims) + [output_dim]
+        # normalize hidden dims to list
+        h_dims = [hidden_dims] if isinstance(hidden_dims, int) else list(hidden_dims)
+
+        # multi-layer perceptron
+        layer_dims = [self.feat_dims] + h_dims + [output_dim]
         self.mlp = nn.Sequential(
             *[
                 layer
-                for i in range(len(layer_dims) - 1)
+                for i, (d_in, d_out) in enumerate(zip(layer_dims[:-1], layer_dims[1:]))
                 for layer in (
-                    [
-                        nn.Linear(
-                            in_features=layer_dims[i], out_features=layer_dims[i + 1]
-                        )
-                    ]
+                    [nn.Linear(d_in, d_out)]
                     + (
                         [nn.ReLU(), nn.Dropout(dropout)]
                         if i < len(layer_dims) - 2
@@ -41,99 +38,59 @@ class SummaryStatsRegressor(nn.Module):
         )
 
     def forward(
-        self,
-        inputs: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
+        self, inputs: torch.Tensor, mask: torch.Tensor | None = None
     ) -> torch.Tensor:
-        # inputs: (batch_size, set_size, input_dim)
-        n_batch, n_set, n_x_dim = inputs.shape
-        assert n_x_dim == self.input_dim, (
-            f"Expected input dim {self.input_dim}, got {n_x_dim}"
-        )
+        # inputs: (batch, set_size, input_dim)
+        batch_size, set_size, feat_dim = inputs.shape
+        if feat_dim != self.input_dim:
+            raise ValueError(f"Expected input dim {self.input_dim}, got {feat_dim}")
 
-        # mask: (batch_size, set_size)
-        mask = (
-            mask.bool()
-            if mask is not None
-            else torch.ones((n_batch, n_set), device=inputs.device, dtype=torch.bool)
-        )
-        assert mask.shape == (n_batch, n_set), (
-            f"Expected mask shape {(n_batch, n_set)}, got {mask.shape}"
-        )
-        valid_mask = mask.unsqueeze(-1)
+        # handle mask: (batch, set_size) -> (batch, set_size, 1)
+        if mask is None:
+            mask_val = torch.ones((batch_size, set_size, 1), device=inputs.device)
+        else:
+            mask = mask.bool()
+            mask_val = mask.unsqueeze(-1).to(inputs.dtype)
 
-        count = valid_mask.sum(dim=1).float()
+        count = mask_val.sum(dim=1)
         safe_count = count.clamp(min=1.0)
-        # check if empty sets
         is_empty = count == 0
 
-        # fill invalid entries with 0 for mean and std computation
-        masked_inputs_zero = inputs.masked_fill(~valid_mask, 0.0)
-        # mean (batch_size, input_dim)
+        # mean and std.
+        masked_inputs_zero = inputs.masked_fill(mask_val == 0, 0.0)
         mean_val = masked_inputs_zero.sum(dim=1) / safe_count
-        # std (batch_size, input_dim)
-        diffs = (inputs - mean_val.unsqueeze(1)).masked_fill(~valid_mask, 0.0)
-        sq_diffs = diffs.pow(2)
-        # safeguard if empty set (count=0)
-        var_val = sq_diffs.sum(dim=1) / (safe_count - 1).clamp(min=1.0)
+
+        diffs = (inputs - mean_val.unsqueeze(1)).masked_fill(mask_val == 0, 0.0)
+        var_val = diffs.pow(2).sum(dim=1) / (safe_count - 1).clamp(min=1.0)
         std_val = var_val.sqrt()
 
-        # fill invalid entries with NaN for percentiles
-        masked_inputs_nan = inputs.masked_fill(~valid_mask, float("nan"))
-        # 25th, 50th (median), 75th percentiles (3, batch_size, input_dim)
+        # percentiles: 25th, 50th (median), 75th
+        masked_inputs_nan = inputs.masked_fill(mask_val == 0, float("nan"))
         q_vals = torch.nanquantile(
             masked_inputs_nan,
             q=torch.tensor([0.25, 0.5, 0.75], device=inputs.device),
             dim=1,
         )
-        # safeguard if empty sets, set quantiles (median) to 0
-        p25_val = torch.where(
-            is_empty,
-            torch.zeros_like(q_vals[0]),
-            q_vals[0],
-        )
-        median_val = torch.where(
-            is_empty,
-            torch.zeros_like(q_vals[1]),
+
+        # min and max
+        min_val = inputs.masked_fill(mask_val == 0, float("inf")).min(dim=1)[0]
+        max_val = inputs.masked_fill(mask_val == 0, float("-inf")).max(dim=1)[0]
+
+        stats = [
+            count,
+            mean_val,
+            # median
             q_vals[1],
-        )
-        p75_val = torch.where(
-            is_empty,
-            torch.zeros_like(q_vals[2]),
-            q_vals[2],
-        )
-
-        # fill invalid entries with +inf/-inf for min/max
-        # min (batch_size, input_dim)
-        min_inputs = inputs.masked_fill(~valid_mask, float("inf"))
-        min_val = min_inputs.min(dim=1)[0]
-        min_val = torch.where(
-            is_empty,
-            torch.zeros_like(min_val),
             min_val,
-        )
-        # max (batch_size, input_dim)
-        max_inputs = inputs.masked_fill(~valid_mask, float("-inf"))
-        max_val = max_inputs.max(dim=1)[0]
-        max_val = torch.where(
-            is_empty,
-            torch.zeros_like(max_val),
             max_val,
-        )
-
-        # pass pooled statistics through MLP
+            std_val,
+            # 25th percentile
+            q_vals[0],
+            # 75th percentile
+            q_vals[2],
+        ]
         pooled_stats = torch.cat(
-            [
-                count,
-                mean_val,
-                median_val,
-                min_val,
-                max_val,
-                std_val,
-                p25_val,
-                p75_val,
-            ],
-            dim=1,
+            [torch.where(is_empty, torch.zeros_like(s), s) for s in stats], dim=1
         )
         # (batch_size, 1 + 7 * input_dim [feat_dims]) -> (batch_size, output_dim)
         return self.mlp(pooled_stats)

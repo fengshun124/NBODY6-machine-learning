@@ -19,35 +19,38 @@ python ./framework/build_dataset.py
 ### Train a Model
 
 ```sh
-    # in case of multiple GPUs, specify which GPU to use
+# use `CUDA_VISIBLE_DEVICES` to select GPU(s) if needed.
 CUDA_VISIBLE_DEVICES=0 python ./framework/train.py \
-    # path to the cached dataset, the ID is generated while constructing the dataset.
-  --data 'cache/9ef03baf1395' \
-    # choose one of the implemented models: 'deep_sets', 'point_net', 'set_transformer'
-  --model 'set_transformer' \
-    # or any feature keys in the dataset   
-  --feature_keys 'x' \
-  --feature_keys 'y' \
-  --feature_keys 'z' \
-  --feature_keys 'vx' \
-  --feature_keys 'vy' \
-  --feature_keys 'vz' \
-    # or any target key in the dataset
-  --target_key 'total_mass_within_2x_r_tidal' \
-    # model hyperparameters, check the implemented models for available options
+  # data configuration
+  --data cache/9ef03baf1395 \
+  --feature-keys x \
+  --feature-keys y \
+  --feature-keys z \
+  --feature-keys vx \
+  --feature-keys vy \
+  --feature-keys vz \
+  --target-key total_mass_within_2x_r_tidal \
+  # model configuration
+  --model set_transformer \
   --hparam 'hidden_dim=8' \
   --hparam 'num_heads=8' \
   --hparam 'num_sabs=4' \
   --hparam 'output_hidden_dims=(4,2)' \
   --hparam 'dropout=0.2' \
-    # training hyperparameters
-  --batch_size '20480' \
-  --num_workers '16' \
-  --learning_rate '1e-4' \
-  --weight_decay '3e-3' \
-  --max_epochs '100' \
-  --log_dir 'logs'
+  # training configuration
+  --batch-size 20480 \
+  --num-workers 16 \
+  -lr 1e-4 \
+  -wd 3e-3 \
+  --max-epochs 100 \
+  --log-dir logs
 ```
+
+Notes:
+
+- Short aliases are available for convenience: `-lr` for `--learning-rate`, and `-wd` for `--weight-decay`.
+- The code expects hyphen-style option names (for example `--feature-keys`, `--target-key`, `--batch-size`).
+- Available models: `deep_sets`, `summary_stats`, `set_transformer`.
 
 ## Model Architecture
 
