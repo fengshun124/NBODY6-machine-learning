@@ -5,7 +5,6 @@ import os
 import shutil
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 import dotenv
 import joblib
@@ -53,14 +52,14 @@ def _is_valid_npz(path: Path) -> bool:
 def dump_run_shard(
     raw_file: Path,
     output_path: Path,
-    feature_keys: List[str],
-    target_keys: List[str],
+    feature_keys: list[str],
+    target_keys: list[str],
     n_sample_per_snapshot: int,
     n_star_per_sample: int,
     drop_probability: float,
-    drop_ratio_range: Tuple[float, float],
+    drop_ratio_range: tuple[float, float],
     seed: int,
-) -> Optional[str]:
+) -> str | None:
     run_id = raw_file.stem.replace("-obs", "")
 
     try:
@@ -116,8 +115,8 @@ def dump_run_shard(
 def merge_split_shards(
     split_dir: Path,
     output_path: Path,
-    feature_keys: List[str],
-    target_keys: List[str],
+    feature_keys: list[str],
+    target_keys: list[str],
     n_star_per_sample: int,
 ) -> bool:
     shard_files = sorted(split_dir.glob("*.npz"))

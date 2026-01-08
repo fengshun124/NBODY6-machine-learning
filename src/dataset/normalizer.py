@@ -1,5 +1,6 @@
 import warnings
-from typing import Any, Dict, Literal, Sequence, Tuple
+from typing import Any, Literal
+from collections.abc import Sequence
 
 import joblib
 import numpy as np
@@ -50,7 +51,7 @@ class Normalizer:
         return self._method
 
     @property
-    def columns(self) -> Tuple[str]:
+    def columns(self) -> tuple[str, ...]:
         return self._columns
 
     @property
@@ -58,7 +59,7 @@ class Normalizer:
         return self._is_fitted
 
     @property
-    def supported_methods(self) -> Tuple[str]:
+    def supported_methods(self) -> tuple[str, ...]:
         return tuple(SUPPORTED_METHODS)
 
     def _init_scaler(self):
@@ -147,7 +148,7 @@ class Normalizer:
     def fit_transform(self, data: np.ndarray) -> np.ndarray:
         return self.fit(data).transform(data)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "columns": self._columns,
             "method": self._method,
@@ -159,7 +160,7 @@ class Normalizer:
         joblib.dump(self.to_dict(), path)
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "Normalizer":
+    def from_dict(cls, d: dict[str, Any]) -> "Normalizer":
         method = d["method"].lower()
 
         # Validate method; fall back to "none" if unsupported
