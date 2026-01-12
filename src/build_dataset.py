@@ -1,608 +1,379 @@
-import hashlib
+import gc
 import json
 import logging
 import os
-import shutil
-from logging.handlers import RotatingFileHandler
+from functools import reduce
 from pathlib import Path
+from typing import Literal, Sequence
 
-import dotenv
 import joblib
 import numpy as np
-from dataset.collector import SnapshotCollector
-from dataset.normalizer import Normalizer
+import pandas as pd
+from dataset.scaler import ArrayScalerBundle, NormMethod
+from dataset.shard import Shard
+from dotenv import load_dotenv
 from joblib import Parallel, delayed
 from tqdm.auto import tqdm
+from utils import OUTPUT_BASE, setup_logger
 
-dotenv.load_dotenv()
+load_dotenv()
+JOBLIB_ROOT = Path(os.getenv("JOBLIB_ROOT")).resolve()
 
 logger = logging.getLogger(__name__)
 
-
-def _fmt_int(n: int) -> str:
-    return f"{n:,}"
+SplitType = Literal["train", "val", "test"]
 
 
-def _fmt_gb(x: float) -> str:
-    return f"{x:,.3f}"
+def _load_split_manifest(manifest_path: Path | str) -> dict:
+    # load split manifest
+    manifest_path = Path(manifest_path).resolve()
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Manifest file not found: {manifest_path}")
+    with open(manifest_path, "r") as f:
+        manifest = {
+            k: v for k, v in json.load(f).items() if k in ["train", "val", "test"]
+        }
+    return manifest
 
 
-def setup_logger(log_file: str) -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="[%(asctime)s][%(processName)s][%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-        handlers=[
-            logging.StreamHandler(),
-            RotatingFileHandler(log_file, maxBytes=5_000_000, backupCount=3),
-        ],
-        force=True,
+def _cache_per_run_shard(
+    run_id: str,
+    split: SplitType,
+    dataset_dir: Path,
+    feature_keys: Sequence[str],
+    target_keys: Sequence[str],
+    min_stars: int = 10,
+    log_file: Path | str | None = None,
+) -> None:
+    # setup logger
+    setup_logger(
+        (
+            Path(log_file).resolve()
+            if log_file is not None
+            else (OUTPUT_BASE / "log" / "build_dataset.log").resolve()
+        )
     )
 
+    shard_file = (dataset_dir / split / f"{run_id}-shard.npz").resolve()
+    if shard_file.is_file():
+        logger.debug(f"[{split}][{run_id}] shard file exists, skip.")
+        return
+    tmp_shard_file = shard_file.with_suffix(".tmp.npz")
+    if tmp_shard_file.exists():
+        logger.debug(f"[{split}][{run_id}] removing temporary shard file ...")
+        tmp_shard_file.unlink()
+    # ensure parent dir exists
+    shard_file.parent.mkdir(parents=True, exist_ok=True)
 
-def _is_valid_npz(path: Path) -> bool:
+    shard = None
     try:
-        with np.load(path) as data:
-            _ = list(data.keys())
-        return True
-    except Exception:
-        return False
-
-
-def dump_run_shard(
-    raw_file: Path,
-    output_path: Path,
-    feature_keys: list[str],
-    target_keys: list[str],
-    n_sample_per_snapshot: int,
-    n_star_per_sample: int,
-    drop_probability: float,
-    drop_ratio_range: tuple[float, float],
-    seed: int,
-) -> str | None:
-    run_id = raw_file.stem.replace("-obs", "")
-
-    try:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        collector = SnapshotCollector.from_joblib(raw_file)
-        n_total_samples = len(collector) * n_sample_per_snapshot
-
-        logger.debug(
-            f"[dump] Processing run {run_id}: will produce {_fmt_int(n_total_samples)} samples -> {output_path.name}"
+        # construct shard file
+        raw_joblib_file = joblib.load(JOBLIB_ROOT / f"{run_id}-obs.joblib")
+        snapshots = [
+            {
+                "feature": pd.DataFrame(snapshot["stars"])
+                .loc[lambda df: df["is_within_2x_r_tidal"]]
+                .reset_index(drop=True)[list(feature_keys)]
+                .to_numpy(),
+                "target": np.asarray([snapshot["header"][key] for key in target_keys]),
+            }
+            for coord, series in raw_joblib_file.items()
+            for timestamp, snapshot in series.items()
+            if (len(pd.DataFrame(snapshot["stars"])) >= min_stars)
+            and ("is_within_2x_r_tidal" in pd.DataFrame(snapshot["stars"]).columns)
+        ]
+        shard = Shard(
+            feature=np.concatenate([s["feature"] for s in snapshots], axis=0),
+            feature_keys=feature_keys,
+            target=np.stack([s["target"] for s in snapshots], axis=0),
+            target_keys=target_keys,
+            ptr=np.cumsum(
+                [0] + [s["feature"].shape[0] for s in snapshots], dtype=np.int64
+            ),
         )
-
-        features = np.empty(
-            (n_total_samples, n_star_per_sample, len(feature_keys)), dtype=np.float32
-        )
-        masks = np.empty((n_total_samples, n_star_per_sample), dtype=bool)
-        targets = np.empty((n_total_samples, len(target_keys)), dtype=np.float32)
-
-        for idx, sample in enumerate(
-            collector.sample_iter(
-                feature_keys=feature_keys,
-                target_keys=target_keys,
-                n_sample_per_snapshot=n_sample_per_snapshot,
-                n_star_per_sample=n_star_per_sample,
-                drop_probability=drop_probability,
-                drop_ratio_range=drop_ratio_range,
-                seed=(seed ^ (hash(run_id) & 0xFFFFFFFF)) & 0xFFFFFFFF,
-            )
-        ):
-            features[idx] = sample["features"]
-            masks[idx] = sample["valid_mask"]
-            targets[idx] = sample["targets"]
 
         # atomic write
-        temp_path = output_path.parent / f".tmp_{output_path.name}"
-        np.savez_compressed(temp_path, features=features, masks=masks, targets=targets)
-        temp_path.rename(output_path)
-
-        logger.debug(f"[dump] Finished run {run_id}: wrote {output_path.name}")
-        return run_id
-
+        logger.debug(f"[{split}][{run_id}] writing shard file ...")
+        shard.to_npz(tmp_shard_file)
+        tmp_shard_file.replace(shard_file)
+        logger.debug(f"[{split}][{run_id}] shard file created: {shard_file}")
     except Exception as e:
-        logger.error(f"Failed to process {raw_file.name}: {e}")
-        # cleanup potential partial files
-        temp_path = output_path.parent / f".tmp_{output_path.name}"
-        if temp_path.exists():
-            temp_path.unlink()
-        if output_path.exists():
-            output_path.unlink()
-        return None
+        logger.exception(f"[{split}][{run_id}] Failed: {e!r}")
+    finally:
+        if tmp_shard_file.exists():
+            tmp_shard_file.unlink()
+        del shard
+        gc.collect()
 
 
-def merge_split_shards(
-    split_dir: Path,
-    output_path: Path,
-    feature_keys: list[str],
-    target_keys: list[str],
-    n_star_per_sample: int,
-) -> bool:
-    shard_files = sorted(split_dir.glob("*.npz"))
-
-    logger.info(
-        f"[merge] {split_dir.name}: found {_fmt_int(len(shard_files))} shard(s)"
+def _merge_per_run_shards(
+    split: SplitType,
+    dataset_dir: Path,
+    run_ids: Sequence[str],
+    log_file: Path | str | None = None,
+) -> None:
+    # setup logger
+    setup_logger(
+        (
+            Path(log_file).resolve()
+            if log_file is not None
+            else (OUTPUT_BASE / "log" / "build_dataset.log").resolve()
+        )
     )
 
-    if not shard_files:
-        logger.warning(f"No shards found in {split_dir}, skipping merge.")
-        return False
+    merged_shard_file = (dataset_dir / f"raw-{split}-shard.npz").resolve()
+    if merged_shard_file.is_file():
+        logger.info(f"[{split}] merged shard file exists, skip.")
+        return
+    tmp_merged_shard_file = merged_shard_file.with_suffix(".tmp.npz")
+    if tmp_merged_shard_file.exists():
+        logger.debug(f"[{split}] removing temporary merged shard file ...")
+        tmp_merged_shard_file.unlink()
 
-    # validate and filter out corrupted shards
-    valid_shards = []
-    for shard_file in shard_files:
-        if _is_valid_npz(shard_file):
-            valid_shards.append(shard_file)
-        else:
-            logger.warning(f"[merge] Removing corrupted shard: {shard_file.name}")
-            shard_file.unlink()
+    try:
+        cached_shard_files = sorted(
+            (dataset_dir / split / f"{run_id}-shard.npz" for run_id in run_ids),
+            key=lambda p: p.name,
+        )
+    except Exception as e:
+        raise RuntimeError(f"[{split}] Failed to fetch cached shard files: {e!r}")
 
-    if not valid_shards:
-        logger.warning(f"No valid shards in {split_dir}, skipping merge.")
-        return False
-
-    shard_files = valid_shards
-
-    # collect metadata and validate consistency
-    run_ids = []
-    sample_counts = []
-
-    for shard_file in shard_files:
-        run_id = shard_file.stem
-        run_ids.append(run_id)
-        with np.load(shard_file) as data:
-            n_stars = data["features"].shape[1]
-            if n_stars != n_star_per_sample:
-                raise ValueError(
-                    f"Inconsistent n_stars in {shard_file.name}: expected {n_star_per_sample}, got {n_stars}"
-                )
-            n_samples = data["features"].shape[0]
-            sample_counts.append(n_samples)
-            logger.debug(
-                f"[merge] {shard_file.name}: {_fmt_int(n_samples)} samples, n_stars={n_stars}"
-            )
-
-    total_samples = sum(sample_counts)
-    n_features = len(feature_keys)
-    n_targets = len(target_keys)
-
-    logger.info(
-        f"[merge] merging {_fmt_int(len(shard_files))} shards -> {output_path.name} ({_fmt_int(total_samples)} samples)"
-    )
-
-    bytes_features = (
-        total_samples * n_star_per_sample * n_features * np.dtype(np.float32).itemsize
-    )
-    bytes_masks = total_samples * n_star_per_sample * np.dtype(bool).itemsize
-    bytes_targets = total_samples * n_targets * np.dtype(np.float32).itemsize
-    bytes_idx = total_samples * np.dtype(np.int32).itemsize * 2
-    est_bytes = bytes_features + bytes_masks + bytes_targets + bytes_idx
-    est_gb = est_bytes / (1024**3)
-    logger.info(f"[merge] prealloc ~ {_fmt_gb(est_gb)} GB")
-
-    all_features = np.empty(
-        (total_samples, n_star_per_sample, n_features), dtype=np.float32
-    )
-    all_masks = np.empty((total_samples, n_star_per_sample), dtype=bool)
-    all_targets = np.empty((total_samples, n_targets), dtype=np.float32)
-    sample_to_run_idx = np.empty(total_samples, dtype=np.int32)
-    sample_to_local_idx = np.empty(total_samples, dtype=np.int32)
-
-    # load and concatenate shards
-    offset = 0
-    for run_idx, shard_file in enumerate(
-        tqdm(
-            shard_files,
-            desc="Merging",
+    merged_shard = None
+    try:
+        with tqdm(
+            total=len(cached_shard_files),
+            desc=f"[{split}] Merging shards",
             unit="shard",
             dynamic_ncols=True,
-        )
-    ):
-        logger.debug(
-            f"[merge] {run_idx + 1}/{len(shard_files)} {shard_file.name} (offset {_fmt_int(offset)})"
-        )
-        with np.load(shard_file) as data:
-            n_samples = data["features"].shape[0]
-            end = offset + n_samples
+            leave=False,
+            position=1,
+        ) as pbar:
 
-            all_features[offset:end] = data["features"]
-            all_masks[offset:end] = data["masks"]
-            all_targets[offset:end] = data["targets"]
+            def _add(a, b):
+                pbar.update(1)
+                return a + b
 
-            sample_to_run_idx[offset:end] = run_idx
-            sample_to_local_idx[offset:end] = np.arange(n_samples, dtype=np.int32)
+            merged_shard = reduce(
+                _add,
+                (Shard.from_npz(shard_file) for shard_file in cached_shard_files),
+            )
+        # atomic write
+        logger.debug(f"[{split}] writing merged shard file ...")
+        merged_shard.to_npz(tmp_merged_shard_file)
+        tmp_merged_shard_file.replace(merged_shard_file)
+        logger.info(f"[{split}] merged shard file created: {merged_shard_file}")
+    except Exception as e:
+        logger.exception(f"[{split}] Failed: {e!r}")
+    finally:
+        if tmp_merged_shard_file.exists():
+            tmp_merged_shard_file.unlink()
+        # remove per-run shard files to save space (safe, no rmtree)
+        per_run_dir = Path(dataset_dir) / split
+        if per_run_dir.exists() and per_run_dir.is_dir():
+            for child in per_run_dir.iterdir():
+                try:
+                    if child.is_file() and (
+                        child.name.endswith("-shard.npz")
+                        or child.name.endswith(".tmp.npz")
+                    ):
+                        child.unlink()
+                except Exception:
+                    logger.debug(f"Failed to remove {child}", exc_info=True)
+            try:
+                per_run_dir.rmdir()
+            except OSError:
+                logger.debug(f"Directory not empty, left {per_run_dir}")
+        del merged_shard
+        gc.collect()
 
-            offset = end
 
-    logger.info(f"[merge] writing {output_path.name}")
-
-    # Atomic write for merged file
-    temp_path = output_path.parent / f".tmp_{output_path.name}"
-    np.savez_compressed(
-        temp_path,
-        features=all_features,
-        masks=all_masks,
-        targets=all_targets,
-        run_ids=np.array(run_ids, dtype=object),
-        sample_to_run_idx=sample_to_run_idx,
-        sample_to_local_idx=sample_to_local_idx,
-        feature_keys=np.array(feature_keys),
-        target_keys=np.array(target_keys),
-    )
-    temp_path.rename(output_path)
-
-    logger.info(
-        f"[merge] merged -> {output_path.name} ({_fmt_int(total_samples)} samples)"
-    )
-    return True
-
-
-def normalize(
-    cache_root: Path,
-    splits: List[str],
-    feature_keys: List[str],
-    target_keys: List[str],
-    feature_normalizers: List[Normalizer],
-    target_normalizers: List[Normalizer],
+def _scale_raw_shard(
+    feature_scaler_bundle: ArrayScalerBundle,
+    target_scaler_bundle: ArrayScalerBundle,
+    split: SplitType,
+    dataset_dir: Path,
+    log_file: Path | str | None = None,
 ) -> None:
-    normalizers_path = cache_root / "normalizers.joblib"
+    # setup logger
+    setup_logger(
+        (
+            Path(log_file).resolve()
+            if log_file is not None
+            else (OUTPUT_BASE / "log" / "build_dataset.log").resolve()
+        )
+    )
 
-    # validate existing normalized files
-    all_normalized_valid = True
-    for split in splits:
-        normalized_path = cache_root / f"{split}.npz"
-        if normalized_path.exists():
-            if not _is_valid_npz(normalized_path):
-                logger.warning(
-                    f"[normalize] Corrupted normalized file detected, removing: {normalized_path.name}"
-                )
-                normalized_path.unlink()
-                all_normalized_valid = False
-        else:
-            all_normalized_valid = False
-
-    # check if normalizers as well as all normalized files exist and valid
-    if all_normalized_valid and normalizers_path.exists():
-        logger.info("[normalize] Normalization phase already completed, skipping.")
+    raw_shard_file = (Path(dataset_dir) / f"raw-{split}-shard.npz").resolve()
+    if not raw_shard_file.exists():
+        logger.error(f"[{split}] raw shard file not found: {raw_shard_file}")
         return
 
-    feature_key_to_idx = {k: i for i, k in enumerate(feature_keys)}
-    target_key_to_idx = {k: i for i, k in enumerate(target_keys)}
+    scaled_shard_file = (Path(dataset_dir) / f"scaled-{split}-shard.npz").resolve()
+    if scaled_shard_file.is_file():
+        logger.info(f"[{split}] scaled shard exists, skip.")
+        return
+    tmp_scaled_shard_file = scaled_shard_file.with_suffix(".tmp.npz")
+    if tmp_scaled_shard_file.exists():
+        logger.debug(f"[{split}] removing temporary scaled shard file ...")
+        tmp_scaled_shard_file.unlink()
 
-    # load training raw data
-    train_raw_path = cache_root / "train-raw.npz"
-    if not train_raw_path.exists():
-        raise FileNotFoundError(
-            f"Training raw file not found: {train_raw_path}. "
-            "Ensure data collection and merging phases completed successfully."
+    shard = None
+    try:
+        shard = Shard.from_npz(raw_shard_file)
+
+        scaled_feature = feature_scaler_bundle.transform(
+            shard.feature, shard.feature_keys
+        )
+        scaled_target = target_scaler_bundle.transform(shard.target, shard.target_keys)
+
+        scaled_shard = Shard(
+            feature=scaled_feature,
+            feature_keys=shard.feature_keys,
+            target=scaled_target,
+            target_keys=shard.target_keys,
+            ptr=shard.pointer,
         )
 
-    if not _is_valid_npz(train_raw_path):
-        raise ValueError(
-            f"Training raw file is corrupted: {train_raw_path}. "
-            "Delete it and re-run to regenerate."
-        )
-
-    logger.info(f"[normalize] Loading training data from {train_raw_path.name}")
-    with np.load(train_raw_path, allow_pickle=True) as data:
-        train_features = data["features"]  # (n_samples, n_stars, n_features)
-        train_targets = data["targets"]  # (n_samples, n_targets)
-
-    logger.info(
-        f"[normalize] Training data: features ({_fmt_int(train_features.shape[0])}, {train_features.shape[1]}, {train_features.shape[2]}), targets ({_fmt_int(train_targets.shape[0])}, {train_targets.shape[1]})"
-    )
-
-    # fit feature normalizers
-    logger.info(
-        f"[normalize] Fitting {len(feature_normalizers)} feature normalizer(s) on training data"
-    )
-    for norm in feature_normalizers:
-        col_indices = [feature_key_to_idx[c] for c in norm.columns]
-        # Extract columns: shape (n_samples, n_stars, len(columns))
-        subset = train_features[:, :, col_indices]
-        norm.fit(subset)
-        logger.info(f"[normalize] - Fitted: {norm}")
-
-    # fit target normalizers
-    logger.info(
-        f"[normalize] Fitting {len(target_normalizers)} target normalizer(s) on training data"
-    )
-    for norm in target_normalizers:
-        col_indices = [target_key_to_idx[c] for c in norm.columns]
-        # extract columns: shape (n_samples, len(columns))
-        subset = train_targets[:, col_indices]
-        norm.fit(subset)
-        logger.info(f"[normalize] - Fitted: {norm}")
-
-    del train_features, train_targets
-
-    # save normalizer
-    logger.info(f"[normalize] Saving normalizers to {normalizers_path.name}")
-    normalizer_data = {
-        "feature_normalizers": [n.to_dict() for n in feature_normalizers],
-        "target_normalizers": [n.to_dict() for n in target_normalizers],
-        "feature_keys": feature_keys,
-        "target_keys": target_keys,
-    }
-    joblib.dump(normalizer_data, normalizers_path)
-
-    # apply normalization to all splits
-    for split in splits:
-        raw_path = cache_root / f"{split}-raw.npz"
-        normalized_path = cache_root / f"{split}.npz"
-
-        if normalized_path.exists() and _is_valid_npz(normalized_path):
-            logger.info(
-                f"[normalize] {split}: normalized file already exists, skipping."
-            )
-            continue
-
-        if not raw_path.exists():
-            logger.warning(f"[normalize] {split}: raw file not found, skipping.")
-            continue
-
-        if not _is_valid_npz(raw_path):
-            logger.warning(f"[normalize] {split}: raw file is corrupted, skipping.")
-            continue
-
-        logger.info(f"[normalize] {split}: loading raw data")
-        with np.load(raw_path, allow_pickle=True) as data:
-            features = data["features"].copy()  # (n_samples, n_stars, n_features)
-            masks = data["masks"].copy()  # (n_samples, n_stars)
-            targets = data["targets"].copy()  # (n_samples, n_targets)
-            run_ids = data["run_ids"].copy()
-            sample_to_run_idx = data["sample_to_run_idx"].copy()
-            sample_to_local_idx = data["sample_to_local_idx"].copy()
-            loaded_feature_keys = data["feature_keys"].copy()
-            loaded_target_keys = data["target_keys"].copy()
-
-        logger.info(
-            f"[normalize] {split}: applying normalization to {_fmt_int(features.shape[0])} samples"
-        )
-
-        # apply feature normalizers
-        for norm in feature_normalizers:
-            col_indices = [feature_key_to_idx[c] for c in norm.columns]
-            # Extract columns: shape (n_samples, n_stars, len(columns))
-            subset = features[:, :, col_indices]
-            features[:, :, col_indices] = norm.transform(subset)
-
-        # apply target normalizers
-        for norm in target_normalizers:
-            col_indices = [target_key_to_idx[c] for c in norm.columns]
-            # extract columns: shape (n_samples, len(columns))
-            subset = targets[:, col_indices]
-            targets[:, col_indices] = norm.transform(subset)
-
-        logger.info(f"[normalize] {split}: writing {normalized_path.name}")
-
-        # atomic write
-        temp_path = normalized_path.parent / f".tmp_{normalized_path.name}"
-        np.savez_compressed(
-            temp_path,
-            features=features,
-            masks=masks,
-            targets=targets,
-            run_ids=run_ids,
-            sample_to_run_idx=sample_to_run_idx,
-            sample_to_local_idx=sample_to_local_idx,
-            feature_keys=loaded_feature_keys,
-            target_keys=loaded_target_keys,
-        )
-        temp_path.rename(normalized_path)
-
-        logger.info(f"[normalize] {split}: done")
-
-    logger.info("[normalize] Normalization phase complete.")
+        logger.debug(f"[{split}] writing scaled shard file ...")
+        scaled_shard.to_npz(tmp_scaled_shard_file)
+        tmp_scaled_shard_file.replace(scaled_shard_file)
+        logger.info(f"[{split}] scaled shard created: {scaled_shard_file}")
+    except Exception as e:
+        logger.exception(f"[{split}] Failed to scale shard: {e!r}")
+    finally:
+        if tmp_scaled_shard_file.exists():
+            tmp_scaled_shard_file.unlink()
+        del shard
+        gc.collect()
 
 
 def build_dataset(
-    manifests: Dict[str, List[str]],
-    n_sample_per_snapshot: int,
-    n_star_per_sample: int,
-    feature_keys: List[str],
-    target_keys: List[str],
-    feature_normalizers: List[Normalizer],
-    target_normalizers: List[Normalizer],
-    drop_probability: float,
-    drop_ratio_range: Tuple[float, float],
-    seed: int,
-    export_path: Path,
+    feature_keys: Sequence[str],
+    target_keys: Sequence[str],
+    feature_scaler_config: dict[tuple[str, ...], NormMethod],
+    target_scaler_config: dict[tuple[str, ...], NormMethod],
+    log_file: Path | str | None = None,
 ) -> None:
-    export_path.mkdir(parents=True, exist_ok=True)
-    setup_logger((export_path / "build_dataset.log"))
+    # setup logger
+    setup_logger(
+        (
+            Path(log_file).resolve()
+            if log_file is not None
+            else (OUTPUT_BASE / "log" / "build_dataset.log").resolve()
+        )
+    )
 
-    cfg_dict = {
-        "feature_keys": feature_keys,
-        "target_keys": target_keys,
-        "feature_normalizers": [
-            {"columns": sorted(norm.columns), "method": norm.method}
-            for norm in feature_normalizers
-        ],
-        "target_normalizers": [
-            {"columns": sorted(norm.columns), "method": norm.method}
-            for norm in target_normalizers
-        ],
-        "n_sample_per_snapshot": n_sample_per_snapshot,
-        "n_star_per_sample": n_star_per_sample,
-        "drop_probability": drop_probability,
-        "drop_ratio_range": drop_ratio_range,
-        "seed": seed,
-        "manifest_summary": {
-            split: hashlib.sha256(",".join(sorted(run_ids)).encode()).hexdigest()[:12]
-            for split, run_ids in manifests.items()
-        },
-    }
-    cfg_hash = hashlib.sha256(
-        json.dumps(cfg_dict, sort_keys=True).encode()
-    ).hexdigest()[:12]
+    dataset_dir = OUTPUT_BASE / "dataset"
+    dataset_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"Dataset build configuration: {json.dumps(cfg_dict, indent=2)}")
-    logger.info(f"Dataset configuration hash: {cfg_hash}")
+    manifest = _load_split_manifest(manifest_path := Path(os.getenv("SPLIT_MFT_JSON")))
+    logger.info(
+        f"Loaded split manifest from {manifest_path}: { {k: len(v) for k, v in manifest.items()} }"
+    )
 
-    cache_root = (export_path / f"{cfg_hash}").resolve()
-    cache_root.mkdir(parents=True, exist_ok=True)
-
-    # save both configuration and full manifest
-    meta_dict = ({**cfg_dict, "manifests": manifests},)
-    with (cache_root / "meta.json").open("w") as f:
-        json.dump(meta_dict, f, indent=2)
-    logger.info(f"Saved dataset configuration to {cache_root / 'meta.json'}")
-
-    splits = list(manifests.keys())
-
-    # process each split: generate shards -> merge -> cleanup
-    for split in splits:
-        split_dir = cache_root / split
-        merged_raw_file = cache_root / f"{split}-raw.npz"
-
-        # check and validate existing merged file
-        if merged_raw_file.exists():
-            if _is_valid_npz(merged_raw_file):
-                logger.info(
-                    f"[{split}] Raw file already exists, proceeding to next split."
-                )
-                continue
-            else:
-                logger.warning(f"[{split}] Corrupted raw file detected, removing.")
-                merged_raw_file.unlink()
-                # fall through to regenerate
-
-        split_dir.mkdir(parents=True, exist_ok=True)
-
-        run_ids = manifests[split]
-
-        # cleanup any corrupted shards first
-        for shard_file in list(split_dir.glob("*.npz")):
-            if not _is_valid_npz(shard_file):
-                logger.warning(f"[{split}] Removing corrupted shard: {shard_file.name}")
-                shard_file.unlink()
-
-        if (obs_dir := os.getenv("OBS_JOBLIB_DIR")) is None:
-            raise ValueError("Environment variable 'OBS_JOBLIB_DIR' is not set")
-
-        pending = [
-            (raw_file, split_dir / f"{run_id}.npz")
-            for run_id in run_ids
-            if (raw_file := Path(obs_dir) / f"{run_id}-obs.joblib").exists()
-            and not (split_dir / f"{run_id}.npz").exists()
-        ]
-
-        n_existing = sum(1 for _ in split_dir.glob("*.npz"))
-
-        if not pending:
-            if n_existing > 0:
-                logger.info(
-                    f"[{split}] All {_fmt_int(n_existing)} shards exist, proceeding to merge."
-                )
-        else:
-            logger.info(
-                f"[{split}] Processing {_fmt_int(len(pending))} shards ({_fmt_int(n_existing)} already done)..."
+    if splits := [
+        split
+        for split in ["train", "val", "test"]
+        if not (dataset_dir / f"raw-{split}-shard.npz").is_file()
+    ]:
+        logger.info(f"Starting to collect shards for splits: {splits}")
+        Parallel(n_jobs=30)(
+            delayed(_cache_per_run_shard)(
+                run_id=run_id,
+                split=split,
+                dataset_dir=dataset_dir,
+                feature_keys=feature_keys,
+                target_keys=target_keys,
+                min_stars=10,
             )
-
-            Parallel(n_jobs=-1, backend="multiprocessing")(
-                tqdm(
-                    [
-                        delayed(dump_run_shard)(
-                            raw_file=raw_file,
-                            output_path=output_path,
-                            feature_keys=feature_keys,
-                            target_keys=target_keys,
-                            n_sample_per_snapshot=n_sample_per_snapshot,
-                            n_star_per_sample=n_star_per_sample,
-                            drop_probability=drop_probability,
-                            drop_ratio_range=drop_ratio_range,
-                            seed=seed,
-                        )
-                        for raw_file, output_path in pending
-                    ],
-                    desc=f"Shards [{split}]",
-                    unit="file",
-                    dynamic_ncols=True,
-                )
+            for split in tqdm(
+                splits,
+                unit="split",
+                dynamic_ncols=True,
+                leave=False,
+                position=0,
             )
-
-            n_completed = sum(1 for _ in split_dir.glob("*.npz"))
-            logger.info(
-                f"[{split}] Data collection phase complete. {_fmt_int(n_completed)} shards processed."
+            for run_id in tqdm(
+                manifest[split],
+                unit="run",
+                dynamic_ncols=True,
+                leave=False,
+                position=1,
             )
+        )
+        logger.info("All shards collected, continue to merging...")
+    else:
+        logger.info("All shards already collected, skip to merging...")
 
-        # merge shards into raw file
-        if not split_dir.exists() or not any(split_dir.glob("*.npz")):
-            logger.warning(f"[{split}] No shards found, skipping merge.")
-            continue
+    Parallel(n_jobs=3)(
+        delayed(_merge_per_run_shards)(
+            split=split,
+            dataset_dir=dataset_dir,
+            run_ids=manifest[split],
+        )
+        for split in ["train", "val", "test"]
+    )
+    logger.info("Split shards merged, continue to scaling...")
 
-        success = merge_split_shards(
-            split_dir=split_dir,
-            output_path=merged_raw_file,
-            feature_keys=feature_keys,
-            target_keys=target_keys,
-            n_star_per_sample=n_star_per_sample,
+    # initialize scaler bundles from config
+    feature_scaler_bundle = ArrayScalerBundle(feature_scaler_config)
+    target_scaler_bundle = ArrayScalerBundle(target_scaler_config)
+
+    # fit scalers using the TRAIN shard
+    train_shard = Shard.from_npz(dataset_dir / "raw-train-shard.npz")
+    feature_scaler_bundle.fit(train_shard.feature, train_shard.feature_keys)
+    target_scaler_bundle.fit(train_shard.target, train_shard.target_keys)
+    del train_shard
+    gc.collect()
+    feature_scaler_bundle.to_joblib(dataset_dir / "feature_scaler_bundle.joblib")
+    target_scaler_bundle.to_joblib(dataset_dir / "target_scaler_bundle.joblib")
+    logger.info("Scalers fitted and saved.")
+
+    for split in tqdm(
+        ["train", "val", "test"],
+        unit="split",
+        dynamic_ncols=True,
+        leave=False,
+        position=0,
+    ):
+        _scale_raw_shard(
+            feature_scaler_bundle=feature_scaler_bundle,
+            target_scaler_bundle=target_scaler_bundle,
+            split=split,
+            dataset_dir=dataset_dir,
         )
 
-        # cleanup individual shards after successful merge
-        if success:
-            if split_dir.exists() and split_dir.is_dir():
-                shutil.rmtree(split_dir)
-                logger.info(f"[{split}] Removed shard directory: {split_dir}")
-        else:
-            logger.warning(f"[{split}] Merge failed, shard directory not removed.")
-
-    # fit and apply normalizers
-    normalize(
-        cache_root=cache_root,
-        splits=splits,
-        feature_keys=feature_keys,
-        target_keys=target_keys,
-        feature_normalizers=feature_normalizers,
-        target_normalizers=target_normalizers,
-    )
+    logger.info("Dataset building completed.")
 
 
 if __name__ == "__main__":
-    FEATURE_KEYS = [
-        "x",
-        "y",
-        "z",
-        "vx",
-        "vy",
-        "vz",
-        "lon_deg",
-        "lat_deg",
-        "pm_lon_coslat_mas_yr",
-        "pm_lat_mas_yr",
-        "log_L_L_sol",
-    ]
-    TARGET_KEYS = ["time", "total_mass_within_2x_r_tidal"]
-
-    if (mft_json_path := os.getenv("MFT_JSON")) is None:
-        raise ValueError("Environment variable 'MFT_JSON' is not set")
-
-    with Path(mft_json_path).resolve().open("r") as f:
-        manifest_dict = json.load(f)
-
     build_dataset(
-        manifests=manifest_dict,
-        n_sample_per_snapshot=6,
-        n_star_per_sample=48,
-        feature_keys=FEATURE_KEYS,
-        target_keys=TARGET_KEYS,
-        feature_normalizers=[
-            Normalizer(columns=["x", "y", "z"], method="z-score"),
-            Normalizer(columns=["vx", "vy", "vz"], method="z-score"),
-            Normalizer(columns=["lon_deg", "lat_deg"], method="z-score"),
-            Normalizer(
-                columns=["pm_lon_coslat_mas_yr", "pm_lat_mas_yr"], method="z-score"
-            ),
-            Normalizer(columns=["log_L_L_sol"], method="z-score"),
-        ],
-        target_normalizers=[
-            Normalizer(columns=["time"], method="z-score"),
-            Normalizer(columns=["total_mass_within_2x_r_tidal"], method="log"),
-        ],
-        drop_probability=0.2,
-        drop_ratio_range=(0.15, 0.25),
-        seed=42,
-        export_path=Path("../cache"),
+        feature_keys=(
+            "x",
+            "y",
+            "z",
+            "vx",
+            "vy",
+            "vz",
+            "lon_deg",
+            "lat_deg",
+            "pm_lon_coslat_mas_yr",
+            "pm_lat_mas_yr",
+            "log_L_L_sol",
+        ),
+        target_keys=(
+            "time",
+            "total_mass_within_2x_r_tidal",
+        ),
+        feature_scaler_config={
+            ("x", "y", "z"): "robust",
+            ("vx", "vy", "vz"): "robust",
+            ("lon_deg", "lat_deg"): "robust",
+            ("pm_lon_coslat_mas_yr", "pm_lat_mas_yr"): "robust",
+            ("log_L_L_sol",): "robust",
+        },
+        target_scaler_config={
+            ("time",): "robust",
+            ("total_mass_within_2x_r_tidal",): "log10_standard",
+        },
     )
