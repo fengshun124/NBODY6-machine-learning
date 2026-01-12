@@ -3,44 +3,17 @@ import logging
 from pathlib import Path
 
 import click
+import numpy as np
 import pytorch_lightning as pl
 import torch
-from dataset.module import NBody6DataModule
-from model.deep_set import DeepSetRegressor
-from model.set_transformer import SetTransformerRegressor
-from model.summary_stats import SummaryStatsRegressor
+from dataset.module import NBODY6DataModule
+from model import DeepSetRegressor, SetTransformerRegressor, SummaryStatsRegressor
 from orchestrator import LightningRegressionOrchestrator
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import CSVLogger
+from utils import OUTPUT_BASE, setup_logger
 
 torch.set_float32_matmul_precision("medium")
-
-logger = logging.getLogger(__name__)
-
-
-def setup_logger(log_file: str) -> None:
-    try:
-        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        logging.basicConfig(
-            level=logging.INFO,
-            format="[%(asctime)s][%(processName)s][%(levelname)s] %(message)s",
-            datefmt="%H:%M:%S",
-            handlers=[logging.StreamHandler()],
-            force=True,
-        )
-        return
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="[%(asctime)s][%(processName)s][%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(log_file),
-        ],
-        force=True,
-    )
 
 
 # model and their default hyperparameters
@@ -221,7 +194,6 @@ def _build_model(
 )
 @click.option("--max-epochs", "max_epochs", type=int, default=50, show_default=True)
 @click.option("--patience", type=int, default=5, show_default=True)
-@click.option("--log-dir", type=click.Path(), default=None)
 def train(
     seed: int,
     data: str | Path,
@@ -237,24 +209,18 @@ def train(
     huber_delta: float,
     max_epochs: int,
     patience: int,
-    log_dir: str | None,
 ) -> None:
-    base_log_dir = Path(log_dir) if log_dir else Path(__file__).parent / "logs"
-    base_log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = str(base_log_dir / "train.log")
-    setup_logger(log_file)
-
     pl.seed_everything(seed, workers=True)
     parsed_hparams = _parse_hparams(hparam_pairs)
 
-    logger.info("Training Configuration:")
-    logger.info(f" - Feature Keys: {feature_keys}")
-    logger.info(f" - Target Key: {target_key}")
+    logging.info("Training Configuration:")
+    logging.info(f" - Feature Keys: {feature_keys}")
+    logging.info(f" - Target Key: {target_key}")
 
-    cache_dir = Path(data)
-    logger.info(f"Loading data from: {cache_dir}")
-    data_module = NBody6DataModule(
-        cache_dir=cache_dir,
+    dataset_dir = Path(data)
+    logging.info(f"Loading data from: {dataset_dir}")
+    data_module = NBODY6DataModule(
+        dataset_dir=dataset_dir,
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=pin_memory,
@@ -264,18 +230,23 @@ def train(
     data_module.setup()
     # print data info
 
-    orchestrator, version = _build_model(
+    orchestrator, version_str = _build_model(
         model_name=model,
-        input_dim=data_module.input_dim,
-        output_dim=data_module.output_dim,
+        input_dim=data_module.feature_dim,
+        output_dim=data_module.target_dim,
         model_hparams=parsed_hparams,
+        batch_size=batch_size,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         huber_delta=huber_delta,
         seed=seed,
     )
+    logging.info(f"Model Version: {version_str}")
 
-    logger.info("Model architecture:\n%s", orchestrator.model)
+    output_dir = OUTPUT_BASE / version_str
+    setup_logger(OUTPUT_BASE / "log" / f"{version_str}.log")
+
+    logging.info("Model architecture:\n%s", orchestrator.model)
 
     trainer = pl.Trainer(
         accelerator="auto",
@@ -283,14 +254,18 @@ def train(
         gradient_clip_val=0.5,
         log_every_n_steps=100,
         deterministic=True,
-        logger=CSVLogger(name="training", version=version, save_dir=base_log_dir),
+        logger=CSVLogger(
+            name="training",
+            version=version_str,
+            save_dir=output_dir,
+        ),
         callbacks=[
             ModelCheckpoint(
                 monitor="val_huber_loss",
                 mode="min",
                 save_top_k=1,
-                dirpath=str(base_log_dir / "checkpoints"),
-                filename=f"{version}-{{epoch:03d}}-{{val_huber_loss:.4e}}",
+                dirpath=str(output_dir / "checkpoints"),
+                filename=f"{version_str}-{{epoch:03d}}-{{val_huber_loss:.4e}}",
             ),
             EarlyStopping(
                 monitor="val_huber_loss",
@@ -307,19 +282,23 @@ def train(
     # evaluation
     try:
         orchestrator.eval()
-        preds_all, targets_all = [], []
+        all_predictions, all_targets = [], []
         with torch.no_grad():
-            for feats, tgt_norm, masks in data_module.test_dataloader():
-                feats = feats.to(orchestrator.device)
-                tgt_norm = tgt_norm.to(orchestrator.device)
+            for features, norm_targets, masks in data_module.test_dataloader():
+                features = features.to(orchestrator.device)
+                norm_targets = norm_targets.to(orchestrator.device)
                 masks = masks.to(orchestrator.device)
 
-                pred_norm = orchestrator(feats, masks)
-                preds_all.append(data_module.denormalize_targets(pred_norm).cpu())
-                targets_all.append(data_module.denormalize_targets(tgt_norm).cpu())
+                norm_prediction = orchestrator(features, masks)
+                all_predictions.append(
+                    np.asarray(data_module.inverse_transform_targets(norm_prediction))
+                )
+                all_targets.append(
+                    np.asarray(data_module.inverse_transform_targets(norm_targets))
+                )
 
-        predictions = torch.cat(preds_all, dim=0)
-        targets = torch.cat(targets_all, dim=0)
+        predictions = torch.from_numpy(np.concatenate(all_predictions, axis=0))
+        targets = torch.from_numpy(np.concatenate(all_targets, axis=0))
 
         mae = (predictions - targets).abs().mean().item()
         rmse = ((predictions - targets) ** 2).mean().sqrt().item()
@@ -327,10 +306,10 @@ def train(
             (predictions - targets).abs() / (targets.abs() + 1e-8)
         ).mean().item() * 100
 
-        logger.info("=" * 60)
-        logger.info("FULL TEST SET EVALUATION (ORIGINAL SCALE)")
-        logger.info("=" * 60)
-        logger.info(f"Total test samples: {len(predictions)}")
+        logging.info("=" * 60)
+        logging.info("FULL TEST SET EVALUATION (ORIGINAL SCALE)")
+        logging.info("=" * 60)
+        logging.info(f"Total test samples: {len(predictions)}")
 
         for i in range(predictions.shape[1]):
             mae_i = (predictions[:, i] - targets[:, i]).abs().mean().item()
@@ -338,13 +317,13 @@ def train(
             rel_i = (
                 (predictions[:, i] - targets[:, i]).abs() / (targets[:, i].abs() + 1e-8)
             ).mean().item() * 100
-            logger.info(
+            logging.info(
                 f" Output dim {i}: MAE={mae_i:.4f} RMSE={rmse_i:.4f} RelErr={rel_i:.2f}%"
             )
 
-        logger.info("-" * 60)
-        logger.info(f"Overall: MAE={mae:.4f} RMSE={rmse:.4f} RelErr={rel:.2f}%")
-        logger.info("=" * 60)
+        logging.info("-" * 60)
+        logging.info(f"Overall: MAE={mae:.4f} RMSE={rmse:.4f} RelErr={rel:.2f}%")
+        logging.info("=" * 60)
 
         # report some of the samples for manual inspection
         n_samples = min(20, len(predictions))
@@ -375,7 +354,7 @@ def train(
             print(" END OF RANDOM SAMPLES ".center(60, "="))
 
     except Exception as e:
-        logger.error(f"Error during test evaluation: {e}")
+        logging.error(f"Error during test evaluation: {e}")
         import traceback
 
         traceback.print_exc()

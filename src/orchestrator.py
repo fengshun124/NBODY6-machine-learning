@@ -50,9 +50,7 @@ class LightningRegressionOrchestrator(pl.LightningModule):
     ) -> torch.Tensor:
         return self.model(X, mask)
 
-    def _evaluation(
-        self, batch, stage: str
-    ) -> torch.Tensor:
+    def _evaluation(self, batch, stage: str) -> torch.Tensor:
         inputs, targets, mask = batch
         mask = mask.bool()
 
@@ -262,7 +260,7 @@ if __name__ == "__main__":
     from pytorch_lightning.loggers import CSVLogger
 
     try:
-        from framework.model.set_transformer import SetTransformerRegressor
+        from src.model.set_transformer import SetTransformerRegressor
     except ImportError:
         from model.set_transformer import SetTransformerRegressor
 
