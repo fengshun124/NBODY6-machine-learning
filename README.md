@@ -35,7 +35,7 @@ After preparing the dataset, use the following command to train a model. Adjust 
 CUDA_VISIBLE_DEVICES=0 python ./train.py \
   # data configuration
   --data cache/9ef03baf1395 \
-  # features and target used during training
+  # features and target used during training, adjust as needed
   --feature-keys x \
   --feature-keys y \
   --feature-keys z \
@@ -69,8 +69,8 @@ Notes:
 
 The framework provides three permutation-invariant architectures for variable-size input sets:
 
-- [`SummaryStatsRegressor`](`./framework/model/summary_stats.py`): computes descriptive statistics (e.g., mean, std, quantiles) across set features, then feeds them to an MLP for regression.
+- [`SummaryStatsRegressor`](./src/model/summary_stats.py): computes descriptive statistics (e.g., mean, std, quantiles) across set features, then feeds them to an MLP for regression.
 
-- [`DeepSetsRegressor`](`./framework/model/deep_sets.py`): applies a per-element encoder, aggregates via a permutation-invariant pooling (e.g., sum/mean), and decodes with an MLP following the Deep Sets design.
+- [`DeepSetsRegressor`](./src/model/deep_sets.py): applies a per-element encoder, aggregates via a permutation-invariant pooling (e.g., sum/mean), and decodes with an MLP following the Deep Sets design.
 
-- [`SetTransformerRegressor`](`./framework/model/set_transformer.py`): uses attention-based Set Transformer blocks to model interactions among members before pooling and final MLP decoding.
+- [`SetTransformerRegressor`](./src/model/set_transformer.py): uses attention-based Set Transformer blocks to model interactions among members before pooling and final MLP decoding.

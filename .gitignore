@@ -1,9 +1,9 @@
-archive
-data
-output
-cache
-logs
-log
+archive*
+output*
+data*
+cache*
+log*
+*bkup*
 
 ### VisualStudioCode template
 .vscode/*
