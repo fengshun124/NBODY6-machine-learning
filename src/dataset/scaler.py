@@ -191,7 +191,7 @@ class ArrayScalerBundle:
             raise ValueError(f"Keys {missing} not in config during {op}")
 
         unused = configured_keys - provided_keys
-        if unused:
+        if unused and op == "fit":
             warnings.warn(f"Configured keys {unused} not provided during {op}")
 
     def fit(self, data: np.ndarray, keys: tuple[str, ...]) -> None:
@@ -215,11 +215,6 @@ class ArrayScalerBundle:
         data = np.asarray(data)
         self._validate_data(data, keys, "transform")
 
-        if self._fitted_keys != keys:
-            warnings.warn(
-                f"Transform keys {keys} differ from fitted keys {self._fitted_keys}"
-            )
-
         result = data.copy()
         indices_map = self._get_indices_map(keys)
         for key_group, scaler in self._scalars.items():
@@ -236,11 +231,6 @@ class ArrayScalerBundle:
 
         data = np.asarray(data)
         self._validate_data(data, keys, "inverse_transform")
-
-        if self._fitted_keys != keys:
-            warnings.warn(
-                f"Inverse transform keys {keys} differ from fitted keys {self._fitted_keys}"
-            )
 
         result = data.copy()
         indices_map = self._get_indices_map(keys)
@@ -269,7 +259,13 @@ class ArrayScalerBundle:
     def to_joblib(self, filepath: Path | str) -> None:
         filepath = Path(filepath)
         filepath.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump(self, filepath)
+        tmp_filepath = filepath.with_suffix(filepath.suffix + ".tmp")
+
+        try:
+            joblib.dump(self, tmp_filepath)
+            tmp_filepath.replace(filepath)
+        finally:
+            tmp_filepath.unlink(missing_ok=True)
 
     @classmethod
     def from_joblib(cls, filepath: Path | str) -> "ArrayScalerBundle":

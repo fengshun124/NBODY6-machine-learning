@@ -10,17 +10,26 @@ load_dotenv()
 
 OUTPUT_BASE = Path(os.getenv("OUTPUT_BASE")).resolve()
 
+# TODO: atomic write utility function
+
 
 def setup_logger(log_file: Path | str) -> None:
     log_file = Path(log_file)
+
+    # avoid adding multiple handlers if already set up
+    root_logger = logging.getLogger()
+    if root_logger.hasHandlers():
+        return
+
     handlers = [logging.StreamHandler()]
     try:
         log_file.parent.mkdir(parents=True, exist_ok=True)
         handlers.append(
             RotatingFileHandler(
                 filename=str(log_file),
-                mode=5_000_000,
-                maxBytes=3,
+                mode="a",
+                maxBytes=5_000_000,
+                backupCount=5,
             )
         )
     except Exception as e:

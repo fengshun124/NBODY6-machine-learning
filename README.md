@@ -41,11 +41,13 @@ python ./src/build_dataset.py
 ```
 
 Outputs produced under `OUTPUT_BASE/dataset/`:
+
 - `raw-<split>-shard.npz` — merged per-split raw shards (train/val/test)
 - `scaled-<split>-shard.npz` — scaled shards used for training and evaluation
 - `feature_scaler_bundle.joblib`, `target_scaler_bundle.joblib` — fitted scalers
 
 Notes:
+
 - The script reads the split manifest at `SPLIT_MFT_JSON` and joblib caches under `JOBLIB_ROOT` (see NBODY6-data-pipeline for cache layout).
 - If you customize feature/target keys or scaler configuration, update the call or the env vars accordingly.
 

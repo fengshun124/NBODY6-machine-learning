@@ -1,3 +1,4 @@
+import random
 from pathlib import Path
 from typing import Sequence
 
@@ -7,6 +8,20 @@ import torch
 from dataset.scaler import ArrayScalerBundle
 from dataset.shard import Shard
 from torch.utils.data import DataLoader, Dataset
+
+
+def _worker_init_fn(worker_id: int) -> None:
+    worker_info = torch.utils.data.get_worker_info()
+    if worker_info is None:
+        return
+
+    dataset = worker_info.dataset
+    base_seed = getattr(dataset, "_base_seed", 0)
+    seed = base_seed + worker_id
+
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
 
 
 class NBODY6SnapshotDataset(Dataset):
@@ -23,12 +38,13 @@ class NBODY6SnapshotDataset(Dataset):
         drop_ratio_range: tuple[float, float] = (0.1, 0.9),
     ) -> None:
         super().__init__()
-        # validate and store shard
+
+        # load shard
         self._shard = (
             shard if isinstance(shard, Shard) else Shard.from_npz(Path(shard).resolve())
         )
 
-        # validate and cache feature column indices
+        # validate and cache feature keys
         self._feature_keys = (
             [feature_keys] if isinstance(feature_keys, str) else list(feature_keys)
         )
@@ -39,118 +55,108 @@ class NBODY6SnapshotDataset(Dataset):
         self._feature_col_indices = [
             self._shard.feature_keys.index(k) for k in self._feature_keys
         ]
-        # validate and cache target column index
+
+        # validate and cache target key
         self._target_key = target_key
-        if self._target_key not in self._shard.target_keys:
+        if target_key not in self._shard.target_keys:
             raise ValueError(
                 f"Expected target_key to be one of {self._shard.target_keys}, got {target_key}."
             )
-        self._target_keys = [self._target_key]
-        self._target_col_idx = [self._shard.target_keys.index(self._target_key)]
+        self._target_col_idx = self._shard.target_keys.index(target_key)
 
-        # validate num_star_per_sample and num_sample_per_snapshot
+        # Validate sampling parameters
         if num_star_per_sample <= 0 or not isinstance(num_star_per_sample, int):
             raise ValueError(
-                f"Expected positive 'int' for 'num_star_per_sample', got {num_star_per_sample}."
+                f"Expected positive integer for 'num_star_per_sample', got {num_star_per_sample}."
             )
         self._num_star_per_sample = num_star_per_sample
+
         if num_sample_per_snapshot <= 0 or not isinstance(num_sample_per_snapshot, int):
             raise ValueError(
-                f"Expected positive 'int' for 'num_sample_per_snapshot', got {num_sample_per_snapshot}."
+                f"Expected positive integer for 'num_sample_per_snapshot', got {num_sample_per_snapshot}."
             )
         self._num_sample_per_snapshot = num_sample_per_snapshot
 
-        self._seed = seed
-
-        # validate data augmentation parameters
+        # validate augmentation parameters
         if not (0.0 <= drop_probability <= 1.0):
             raise ValueError(
                 f"Expected 'drop_probability' to be in [0.0, 1.0], got {drop_probability}."
             )
         self._drop_probability = drop_probability
+
         if not (0.0 <= drop_ratio_range[0] < drop_ratio_range[1] <= 1.0):
             raise ValueError(
                 f"Expected 'drop_ratio_range' to be in [0.0, 1.0] with lower < upper, got {drop_ratio_range}."
             )
         self._drop_ratio_range = drop_ratio_range
 
-        # initialize random number generator
-        self._seed_seq = np.random.SeedSequence(
-            [seed, self._num_star_per_sample, self._num_sample_per_snapshot]
-        )
-
-    def __repr__(self):
-        return (
-            f"{__class__.__name__}(shard={self._shard}, "
-            f"feature_keys={self._feature_keys}, "
-            f"target_keys={self._target_keys}, "
-            f"sample_config={self.sample_params}, "
-            f"augment_config={self.augment_params}"
-            ")"
-        )
+        # store seed for determinism
+        self._seed = seed
+        self._base_seed = seed
+        self._seed_seq = np.random.SeedSequence(seed)
 
     def __len__(self) -> int:
         return self.n_snapshots * self._num_sample_per_snapshot
 
-    def __getitem__(self, index):
+    def __getitem__(self, index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         sample_idx = int(index % self._num_sample_per_snapshot)
         snapshot_idx = int(index // self._num_sample_per_snapshot)
 
-        # deterministic RNG per sample
+        # create deterministic RNG for this specific sample
         rng = np.random.default_rng(
             np.random.SeedSequence(
                 entropy=self._seed_seq.entropy,
                 spawn_key=(
-                    *self._seed_seq.spawn_key,
+                    self._seed_seq.spawn_key[0] if self._seed_seq.spawn_key else 0,
                     snapshot_idx,
                     sample_idx,
                 ),
             )
         )
 
-        # extract and filter data using cached indices
+        # get data from shard
         full_features, full_targets = self._shard[snapshot_idx]
         features = full_features[:, self._feature_col_indices]
-        targets = np.asarray([full_targets[i] for i in self._target_col_idx])
+        target = full_targets[self._target_col_idx]
 
         n_stars = features.shape[0]
 
-        # prepare output buffers (padded positions explicitly remain zero)
+        # initialize output buffers
         sampled_features = np.zeros(
-            (self._num_star_per_sample, self.feature_dim), dtype=features.dtype
+            (self._num_star_per_sample, self.feature_dim), dtype=np.float32
         )
-        valid_mask = np.zeros((self._num_star_per_sample,), dtype=bool)
+        valid_mask = np.zeros(self._num_star_per_sample, dtype=bool)
 
-        # shrink pool via optional augmentation
         if n_stars >= self._num_star_per_sample:
-            pool = np.arange(n_stars)
-            if rng.random() < self._drop_probability:
-                drop_ratio = rng.uniform(*self._drop_ratio_range)
-                keep_count = max(1, int((1.0 - drop_ratio) * n_stars))
-                pool = rng.choice(pool, size=keep_count, replace=False)
-            # sample with replacement only if needed to reach required size
-            if len(pool) >= self._num_star_per_sample:
-                chosen = rng.choice(
-                    pool,
-                    size=self._num_star_per_sample,
-                    replace=False,
-                )
-            else:
-                extra = rng.choice(
-                    pool,
-                    size=self._num_star_per_sample - len(pool),
-                    replace=True,
-                )
-                chosen = np.concatenate([pool, extra])
-
+            # enough stars: sample without replacement
+            chosen = rng.choice(
+                n_stars,
+                size=self._num_star_per_sample,
+                replace=False,
+            )
             sampled_features[:] = features[chosen]
             valid_mask[:] = True
-        # insufficient stars: take all, remaining positions stay zero-padded
+
+            # apply optional dropout augmentation on sampled data
+            if rng.random() < self._drop_probability:
+                drop_ratio = rng.uniform(*self._drop_ratio_range)
+                drop_count = int(drop_ratio * self._num_star_per_sample)
+                drop_count = max(0, min(drop_count, self._num_star_per_sample - 1))
+
+                if drop_count > 0:
+                    drop_indices = rng.choice(
+                        self._num_star_per_sample,
+                        size=drop_count,
+                        replace=False,
+                    )
+                    sampled_features[drop_indices] = 0
+                    valid_mask[drop_indices] = False
         else:
+            # insufficient stars: use all available + padding
             sampled_features[:n_stars] = features
             valid_mask[:n_stars] = True
 
-        return sampled_features, targets, valid_mask
+        return sampled_features, np.array([target], dtype=np.float32), valid_mask
 
     @property
     def shard(self) -> Shard:
@@ -169,32 +175,8 @@ class NBODY6SnapshotDataset(Dataset):
         return len(self._feature_keys)
 
     @property
-    def target_keys(self) -> list[str]:
-        return self._target_keys
-
-    @property
-    def target_dim(self) -> int:
-        return len(self._target_keys)
-
-    @property
     def target_key(self) -> str:
         return self._target_key
-
-    @property
-    def sample_params(self) -> dict:
-        return {
-            "num_star_per_sample": self._num_star_per_sample,
-            "num_sample_per_snapshot": self._num_sample_per_snapshot,
-            "seed": self._seed,
-        }
-
-    @property
-    def augment_params(self) -> dict:
-        return {
-            "drop_probability": self._drop_probability,
-            "drop_ratio_range": self._drop_ratio_range,
-            "seed": self._seed,
-        }
 
 
 class NBODY6DataModule(pl.LightningDataModule):
@@ -220,14 +202,27 @@ class NBODY6DataModule(pl.LightningDataModule):
             if not isinstance(feature_keys, str)
             else (feature_keys,)
         )
-
         self._target_key = target_key
+        self._seed = seed
 
+        # DataLoader configuration
         self.loader_params = {
             "batch_size": int(batch_size),
             "num_workers": int(num_workers),
             "pin_memory": bool(pin_memory),
         }
+
+        # worker settings for multi-worker loading
+        if self.loader_params["num_workers"] > 0:
+            self.loader_params.update(
+                {
+                    "persistent_workers": True,
+                    "prefetch_factor": 2,
+                    "worker_init_fn": _worker_init_fn,
+                }
+            )
+
+        # Dataset configuration
         self.dataset_params = {
             "feature_keys": self._feature_keys,
             "target_key": self._target_key,
@@ -239,15 +234,14 @@ class NBODY6DataModule(pl.LightningDataModule):
         }
         self.shuffle_train = bool(shuffle_train)
 
+        # lazy-loaded datasets
         self.train_dataset: NBODY6SnapshotDataset | None = None
         self.val_dataset: NBODY6SnapshotDataset | None = None
         self.test_dataset: NBODY6SnapshotDataset | None = None
 
+        # scalers
         self._feature_scaler_bundle: ArrayScalerBundle | None = None
         self._target_scaler_bundle: ArrayScalerBundle | None = None
-
-    def __repr__(self):
-        return super().__repr__()
 
     @property
     def feature_keys(self) -> tuple[str, ...]:
@@ -282,7 +276,7 @@ class NBODY6DataModule(pl.LightningDataModule):
             self._dataset_dir / "target_scaler_bundle.joblib"
         )
 
-        # initialize datasets
+        # initialize train/val datasets
         if stage in (None, "fit", "validate"):
             if self.train_dataset is None:
                 self.train_dataset = NBODY6SnapshotDataset(
@@ -295,11 +289,13 @@ class NBODY6DataModule(pl.LightningDataModule):
                     **self.dataset_params,
                 )
 
-        if stage in (None, "test", "predict") and self.test_dataset is None:
-            self.test_dataset = NBODY6SnapshotDataset(
-                shard=self._dataset_dir / "scaled-test-shard.npz",
-                **self.dataset_params,
-            )
+        # initialize test dataset
+        if stage in (None, "test", "predict"):
+            if self.test_dataset is None:
+                self.test_dataset = NBODY6SnapshotDataset(
+                    shard=self._dataset_dir / "scaled-test-shard.npz",
+                    **self.dataset_params,
+                )
 
     @staticmethod
     def _collate_fn(
@@ -308,46 +304,54 @@ class NBODY6DataModule(pl.LightningDataModule):
         features, targets, masks = zip(*batch)
         return (
             torch.from_numpy(np.stack(features)).float(),
-            torch.from_numpy(np.stack(targets)).float(),
+            torch.from_numpy(np.stack(targets)).float().squeeze(-1),
             torch.from_numpy(np.stack(masks)).bool(),
+        )
+
+    def _make_dataloader(self, dataset: Dataset, shuffle: bool) -> DataLoader:
+        sampler = None
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                dataset,
+                shuffle=shuffle,
+                seed=self._seed,
+            )
+
+        dl_shuffle = False if sampler is not None else shuffle
+
+        gen = torch.Generator()
+        gen.manual_seed(self._seed)
+
+        return DataLoader(
+            dataset,
+            sampler=sampler,
+            shuffle=dl_shuffle,
+            collate_fn=self._collate_fn,
+            generator=gen,
+            **self.loader_params,
         )
 
     def train_dataloader(self) -> DataLoader:
         if self.train_dataset is None:
             self.setup("fit")
-        return DataLoader(
-            self.train_dataset,
-            shuffle=self.shuffle_train,
-            collate_fn=self._collate_fn,
-            **self.loader_params,
-        )
+        return self._make_dataloader(self.train_dataset, shuffle=self.shuffle_train)
 
     def val_dataloader(self) -> DataLoader:
         if self.val_dataset is None:
             self.setup("validate")
-        return DataLoader(
-            self.val_dataset,
-            shuffle=False,
-            collate_fn=self._collate_fn,
-            **self.loader_params,
-        )
+        return self._make_dataloader(self.val_dataset, shuffle=False)
 
     def test_dataloader(self) -> DataLoader:
         if self.test_dataset is None:
             self.setup("test")
-        return DataLoader(
-            self.test_dataset,
-            shuffle=False,
-            collate_fn=self._collate_fn,
-            **self.loader_params,
-        )
+        return self._make_dataloader(self.test_dataset, shuffle=False)
 
     def inverse_transform_features(
         self,
         features: torch.Tensor | np.ndarray,
     ) -> np.ndarray:
         if not self._feature_scaler_bundle:
-            raise RuntimeError("Scalers were not loaded. Call `setup()` first.")
+            raise RuntimeError("Scalers not loaded. Call setup() first.")
 
         arr = (
             features.detach().cpu().numpy()
@@ -367,7 +371,7 @@ class NBODY6DataModule(pl.LightningDataModule):
         targets: torch.Tensor | np.ndarray,
     ) -> np.ndarray:
         if not self._target_scaler_bundle:
-            raise RuntimeError("Scalers were not loaded. Call `setup()` first.")
+            raise RuntimeError("Scalers not loaded. Call setup() first.")
 
         arr = (
             targets.detach().cpu().numpy()
@@ -375,6 +379,6 @@ class NBODY6DataModule(pl.LightningDataModule):
             else np.asarray(targets)
         )
         return self._target_scaler_bundle.inverse_transform(
-            data=arr,
+            data=arr.reshape(-1, 1),
             keys=(self._target_key,),
-        )
+        ).squeeze(-1)

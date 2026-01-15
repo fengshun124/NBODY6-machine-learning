@@ -58,10 +58,6 @@ def _cache_per_run_shard(
     if shard_file.is_file():
         logger.debug(f"[{split}][{run_id}] shard file exists, skip.")
         return
-    tmp_shard_file = shard_file.with_suffix(".tmp.npz")
-    if tmp_shard_file.exists():
-        logger.debug(f"[{split}][{run_id}] removing temporary shard file ...")
-        tmp_shard_file.unlink()
     # ensure parent dir exists
     shard_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -91,17 +87,13 @@ def _cache_per_run_shard(
                 [0] + [s["feature"].shape[0] for s in snapshots], dtype=np.int64
             ),
         )
-
-        # atomic write
         logger.debug(f"[{split}][{run_id}] writing shard file ...")
-        shard.to_npz(tmp_shard_file)
-        tmp_shard_file.replace(shard_file)
+
+        shard.to_npz(shard_file)
         logger.debug(f"[{split}][{run_id}] shard file created: {shard_file}")
     except Exception as e:
         logger.exception(f"[{split}][{run_id}] Failed: {e!r}")
     finally:
-        if tmp_shard_file.exists():
-            tmp_shard_file.unlink()
         del shard
         gc.collect()
 

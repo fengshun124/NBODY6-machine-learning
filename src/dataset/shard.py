@@ -183,15 +183,19 @@ class Shard:
     # I/O operations
     def to_npz(self, filepath: Path | str) -> None:
         filepath = Path(filepath)
+        tmp_filepath = filepath.with_suffix(filepath.suffix + ".tmp")
 
-        np.savez_compressed(
-            filepath,
-            feature=self._feature,
-            feature_keys=np.array(self._feature_keys, dtype="U"),
-            target=self._target,
-            target_keys=np.array(self._target_keys, dtype="U"),
-            ptr=self._ptr,
-        )
+        try:
+            np.savez_compressed(
+                filepath,
+                feature=self._feature,
+                feature_keys=np.array(self._feature_keys, dtype="U"),
+                target=self._target,
+                target_keys=np.array(self._target_keys, dtype="U"),
+                ptr=self._ptr,
+            )
+        finally:
+            tmp_filepath.unlink(missing_ok=True)
 
     @classmethod
     def from_npz(cls, filepath: Path | str) -> "Shard":
