@@ -258,7 +258,6 @@ class ArrayScalerBundle:
 
     def to_joblib(self, filepath: Path | str) -> None:
         filepath = Path(filepath)
-        filepath.parent.mkdir(parents=True, exist_ok=True)
         tmp_filepath = filepath.with_suffix(filepath.suffix + ".tmp")
 
         try:

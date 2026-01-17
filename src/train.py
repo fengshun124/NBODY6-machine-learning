@@ -156,6 +156,80 @@ def _build_model(
     return orchestrator, version
 
 
+class TestNPZWriter(pl.Callback):
+    def __init__(
+        self,
+        output_file: Path | str,
+    ) -> None:
+        self._output_file = Path(output_file).resolve()
+
+        self._sample_id_buffer = []
+        self._prediction_original_buffer = []
+        self._prediction_scaled_buffer = []
+        self._target_original_buffer = []
+        self._target_scaled_buffer = []
+
+    def on_test_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        self._output_file.parent.mkdir(parents=True, exist_ok=True)
+
+        self._sample_id_buffer.clear()
+        self._prediction_original_buffer.clear()
+        self._prediction_scaled_buffer.clear()
+        self._target_original_buffer.clear()
+        self._target_scaled_buffer.clear()
+
+    def on_test_batch_end(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        outputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ) -> None:
+        predictions_scaled, targets_scaled, sample_ids = outputs
+
+        predictions_scaled_np = predictions_scaled.detach().cpu().numpy()
+        targets_scaled_np = targets_scaled.detach().cpu().numpy()
+        sample_ids_np = sample_ids.detach().cpu().numpy()
+
+        data_module = trainer.datamodule
+        predictions_original_np = data_module.inverse_transform_targets(
+            predictions_scaled_np
+        )
+        targets_original_np = data_module.inverse_transform_targets(targets_scaled_np)
+
+        self._sample_id_buffer.append(sample_ids_np)
+        self._prediction_scaled_buffer.append(predictions_scaled_np)
+        self._target_scaled_buffer.append(targets_scaled_np)
+        self._prediction_original_buffer.append(predictions_original_np)
+        self._target_original_buffer.append(targets_original_np)
+
+    def on_test_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        sample_ids = np.concatenate(self._sample_id_buffer, axis=0)
+        predictions_scaled = np.concatenate(self._prediction_scaled_buffer, axis=0)
+        targets_scaled = np.concatenate(self._target_scaled_buffer, axis=0)
+        predictions_original = np.concatenate(self._prediction_original_buffer, axis=0)
+        targets_original = np.concatenate(self._target_original_buffer, axis=0)
+
+        np.savez_compressed(
+            self._output_file,
+            sample_id=sample_ids,
+            prediction_scaled=predictions_scaled,
+            target_scaled=targets_scaled,
+            prediction_original=predictions_original,
+            target_original=targets_original,
+        )
+
+        logger.info(f"Test results saved to: {self._output_file}")
+
+        self._sample_id_buffer.clear()
+        self._prediction_original_buffer.clear()
+        self._prediction_scaled_buffer.clear()
+        self._target_original_buffer.clear()
+        self._target_scaled_buffer.clear()
+
+
 @click.command()
 @click.option(
     "--seed",
@@ -314,9 +388,8 @@ def train(
     )
     logger.info(f"Model Version: {version_str}")
 
-    output_dir = OUTPUT_BASE / "train" / version_str
+    output_dir = OUTPUT_BASE / "experiments" / version_str
     output_dir.mkdir(parents=True, exist_ok=True)
-    setup_logger(output_dir / f"{version_str}.log")
 
     logger.info("Model Architecture:\n%s", orchestrator.model)
 
@@ -345,143 +418,33 @@ def train(
                 mode="min",
                 strict=True,
             ),
+            TestNPZWriter(
+                output_file=(
+                    test_npz_file := (output_dir / f"{version_str}-test.npz").resolve()
+                ),
+            ),
         ],
     )
 
     trainer.fit(orchestrator, datamodule=data_module)
-    trainer.test(orchestrator, datamodule=data_module)
+    trainer.test(orchestrator, datamodule=data_module, ckpt_path="best")
 
-    # # evaluation
-    # try:
-    #     orchestrator.eval()
-    #     predictions_original_list, targets_original_list = [], []
-    #     predictions_scaled_list, targets_scaled_list = [], []
-
-    #     with torch.no_grad():
-    #         for features, batch_scaled_targets, masks in data_module.test_dataloader():
-    #             features = features.to(orchestrator.device)
-    #             batch_scaled_targets = batch_scaled_targets.to(orchestrator.device)
-    #             masks = masks.to(orchestrator.device)
-
-    #             batch_scaled_prediction = orchestrator(features, masks)
-
-    #             # convert tensors to numpy arrays
-    #             batch_predictions_scaled = (
-    #                 batch_scaled_prediction.detach().cpu().numpy()
-    #             )
-    #             batch_targets_scaled = batch_scaled_targets.detach().cpu().numpy()
-
-    #             predictions_scaled_list.append(batch_predictions_scaled)
-    #             targets_scaled_list.append(batch_targets_scaled)
-
-    #             # transform to original scale
-    #             predictions_original_list.append(
-    #                 data_module.inverse_transform_targets(batch_predictions_scaled)
-    #             )
-    #             targets_original_list.append(
-    #                 data_module.inverse_transform_targets(batch_targets_scaled)
-    #             )
-
-    #     # concatenate all batches
-    #     predictions_original = np.concatenate(predictions_original_list, axis=0)
-    #     targets_original = np.concatenate(targets_original_list, axis=0)
-    #     predictions_scaled = np.concatenate(predictions_scaled_list, axis=0)
-    #     targets_scaled = np.concatenate(targets_scaled_list, axis=0)
-
-    #     # reshape to 2D if needed (batch_size, output_dim)
-    #     predictions_original, targets_original, predictions_scaled, targets_scaled = [
-    #         arr if arr.ndim > 1 else arr[:, np.newaxis]
-    #         for arr in [
-    #             predictions_original,
-    #             targets_original,
-    #             predictions_scaled,
-    #             targets_scaled,
-    #         ]
-    #     ]
-
-    #     # save predictions and targets to CSV
-    #     pd.DataFrame(
-    #         {
-    #             "scaled_prediction": predictions_scaled.flatten(),
-    #             "scaled_target": targets_scaled.flatten(),
-    #             "prediction": predictions_original.flatten(),
-    #             "target": targets_original.flatten(),
-    #         }
-    #     ).to_csv(output_dir / f"{version_str}-test.csv", index=False)
-
-    #     # Compute evaluation metrics
-    #     error = predictions_original - targets_original
-    #     mae = np.abs(error).mean()
-    #     rmse = np.sqrt((error**2).mean())
-    #     rel_error = (np.abs(error) / (np.abs(targets_original) + 1e-8)).mean() * 100
-
-    #     logger.info("=" * 60)
-    #     logger.info("FULL TEST SET EVALUATION (ORIGINAL SCALE)")
-    #     logger.info("=" * 60)
-    #     logger.info(f"Total test samples: {len(predictions_original)}")
-
-    #     # Per-dimension metrics (vectorized)
-    #     for dimension_index in range(predictions_original.shape[1]):
-    #         error_dimension = (
-    #             predictions_original[:, dimension_index]
-    #             - targets_original[:, dimension_index]
-    #         )
-    #         mae_dimension = np.abs(error_dimension).mean()
-    #         rmse_dimension = np.sqrt((error_dimension**2).mean())
-    #         rel_dimension = (
-    #             np.abs(error_dimension)
-    #             / (np.abs(targets_original[:, dimension_index]) + 1e-8)
-    #         ).mean() * 100
-    #         logger.info(
-    #             f" {dimension_index}: MAE={mae_dimension:.4f} RMSE={rmse_dimension:.4f} RelErr={rel_dimension:.2f}%"
-    #         )
-
-    #     logger.info("-" * 60)
-    #     logger.info(f"Overall: MAE={mae:.4f} RMSE={rmse:.4f} RelErr={rel_error:.2f}%")
-    #     logger.info("=" * 60)
-
-    #     # report sample predictions for manual inspection
-    #     number_of_samples = min(20, len(predictions_original))
-    #     if number_of_samples > 0:
-    #         sample_indices = np.sort(
-    #             np.random.choice(
-    #                 len(predictions_original), number_of_samples, replace=False
-    #             )
-    #         )
-    #         logger.info(
-    #             "\n" + f" RANDOM TEST SAMPLES (n={number_of_samples}) ".center(60, "=")
-    #         )
-    #         logger.info(f"{'Index':>8} {'Prediction':>15} {'Target':>15} {'Error':>15}")
-    #         logger.info("-" * 60)
-
-    #         for sample_index in sample_indices:
-    #             prediction_value = (
-    #                 predictions_original[sample_index, 0]
-    #                 if predictions_original.shape[1] > 0
-    #                 else predictions_original[sample_index]
-    #             )
-    #             target_value = (
-    #                 targets_original[sample_index, 0]
-    #                 if targets_original.shape[1] > 0
-    #                 else targets_original[sample_index]
-    #             )
-    #             logger.info(
-    #                 f"{sample_index:>8} {prediction_value:>15.4f} {target_value:>15.4f} {prediction_value - target_value:>15.4f}"
-    #             )
-
-    #         sample_error = (
-    #             predictions_original[sample_indices] - targets_original[sample_indices]
-    #         )
-    #         sample_mean_absolute_error = np.abs(sample_error).mean()
-    #         logger.info("-" * 60)
-    #         logger.info(f"Sample Mean Absolute Error: {sample_mean_absolute_error:.4f}")
-    #         logger.info(" END OF RANDOM SAMPLES ".center(60, "="))
-
-    # except Exception as e:
-    #     logger.error(f"Error during test evaluation: {e}")
-    #     import traceback
-
-    #     traceback.print_exc()
+    # load the test results and print samples
+    try:
+        with np.load(test_npz_file) as npz:
+            df = pd.DataFrame(
+                {
+                    "sample_id": npz["sample_id"],
+                    "prediction_original": npz["prediction_original"].flatten(),
+                    "target_original": npz["target_original"].flatten(),
+                    "prediction_scaled": npz["prediction_scaled"].flatten(),
+                    "target_scaled": npz["target_scaled"].flatten(),
+                }
+            )
+        logger.info("Test Results Samples:")
+        logger.info("\n%s", df.head(10).to_string(index=False))
+    except Exception as e:
+        logger.error(f"Failed to load test results from {test_npz_file}: {e}")
 
 
 if __name__ == "__main__":

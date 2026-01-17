@@ -10,8 +10,6 @@ load_dotenv()
 
 OUTPUT_BASE = Path(os.getenv("OUTPUT_BASE")).resolve()
 
-# TODO: atomic write utility function
-
 
 def setup_logger(log_file: Path | str) -> None:
     log_file = Path(log_file)

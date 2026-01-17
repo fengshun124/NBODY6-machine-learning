@@ -2,10 +2,10 @@ from typing import Any, Type
 
 import pytorch_lightning as pl
 import torch
-import torchmetrics
 from torch import nn
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset
+from torchmetrics import MeanAbsoluteError, MeanSquaredError
 
 
 class LightningRegressionOrchestrator(pl.LightningModule):
@@ -25,6 +25,7 @@ class LightningRegressionOrchestrator(pl.LightningModule):
                 "learning_rate": learning_rate,
                 "weight_decay": weight_decay,
                 "model_hparams": hyperparameters,
+                "loss_huber_delta": huber_delta,
                 "seed": seed,
             }
         )
@@ -36,28 +37,30 @@ class LightningRegressionOrchestrator(pl.LightningModule):
 
         self.loss_fn = nn.HuberLoss(delta=huber_delta)
 
-        self.train_mae = torchmetrics.MeanAbsoluteError()
-        self.train_mse = torchmetrics.MeanSquaredError()
+        self.train_mae = MeanAbsoluteError()
+        self.train_mse = MeanSquaredError()
 
-        self.val_mae = torchmetrics.MeanAbsoluteError()
-        self.val_mse = torchmetrics.MeanSquaredError()
+        self.val_mae = MeanAbsoluteError()
+        self.val_mse = MeanSquaredError()
 
-        self.test_mae = torchmetrics.MeanAbsoluteError()
-        self.test_mse = torchmetrics.MeanSquaredError()
+        self.test_mae = MeanAbsoluteError()
+        self.test_mse = MeanSquaredError()
 
     def forward(
         self, X: torch.Tensor, mask: torch.Tensor | None = None
     ) -> torch.Tensor:
         return self.model(X, mask)
 
-    def _evaluation(self, batch, stage: str) -> torch.Tensor:
-        inputs, targets, mask = batch
+    def _evaluation(
+        self, batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], stage: str
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        inputs, targets, mask, sample_ids = batch
         mask = mask.bool()
 
-        preds = self(inputs, mask).view(-1)
-        targets = targets.view(-1).to(preds)
+        predictions = self(inputs, mask).view(-1)
+        targets = targets.view(-1).to(predictions)
 
-        loss = self.loss_fn(preds, targets)
+        loss = self.loss_fn(predictions, targets)
 
         self.log(
             f"{stage}_huber_loss",
@@ -70,7 +73,7 @@ class LightningRegressionOrchestrator(pl.LightningModule):
 
         for metric_key in ["mae", "mse"]:
             metric = getattr(self, f"{stage}_{metric_key}")
-            metric(preds, targets)
+            metric(predictions, targets)
             self.log(
                 f"{stage}_{metric_key}",
                 metric,
@@ -80,16 +83,22 @@ class LightningRegressionOrchestrator(pl.LightningModule):
                 sync_dist=True,
             )
 
-        return loss
+        return loss, predictions, targets, sample_ids
 
     def training_step(self, batch, batch_idx) -> torch.Tensor:
-        return self._evaluation(batch=batch, stage="train")
+        loss, _, _, _ = self._evaluation(batch=batch, stage="train")
+        return loss
 
     def validation_step(self, batch, batch_idx) -> None:
         self._evaluation(batch=batch, stage="val")
 
-    def test_step(self, batch, batch_idx) -> None:
-        self._evaluation(batch=batch, stage="test")
+    def test_step(
+        self, batch, batch_idx
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        _, predictions, targets, sample_ids = self._evaluation(
+            batch=batch, stage="test"
+        )
+        return predictions, targets, sample_ids
 
     def configure_optimizers(self) -> dict[str, Any]:
         optimizer = torch.optim.AdamW(

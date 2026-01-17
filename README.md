@@ -58,7 +58,7 @@ After building the dataset, invoke the training entrypoint from `machine-learnin
 ```bash
 # Example: use one GPU
 CUDA_VISIBLE_DEVICES=0 python ./src/train.py \
-  --data /path/to/cached/dataset/ \
+  --dataset /path/to/cached/dataset/ \
   --feature-keys x \
   --feature-keys y \
   --feature-keys z \
@@ -72,22 +72,22 @@ CUDA_VISIBLE_DEVICES=0 python ./src/train.py \
   --hparam 'num_sabs=4' \
   --hparam 'output_hidden_dims=(4,2)' \
   --hparam 'dropout=0.2' \
-  --batch-size 20480 \
   --num-workers 16 \
+  -bs 20480 \
   -lr 1e-4 \
   -wd 3e-3 \
   --max-epochs 100
 ```
 
 Key Options:
-- `--data`: path to the `dataset` folder created by `build_dataset.py`.
+- `--dataset`: path to the `dataset` folder created by `build_dataset.py`.
 - `--feature-keys`: repeatable; per-element input features (e.g., `x`, `y`, `z`, `vx`, `vy`, `vz`).
 - `--target-key`: regression target to predict.
 - `--model`: model architecture name (`set_transformer`, `deep_sets`, `summary_stats`).
 - `--hparam KEY=VALUE`: model hyperparameters (repeatable). Values accept Python literals (numbers, tuples, booleans).
 - `-lr` / `-wd`: shorthand for `--learning-rate` and `--weight-decay`.
 
-Other useful flags: `--batch-size`, `--num-workers`, `--max-epochs`, `--patience`, `--seed` (see `src/train.py` for defaults and more options).
+Other useful flags: `--batch-size`, `--num-workers`, `--max-epochs`, `--patience`, `--seed` (see [`src/train.py`](./src/train.py) for defaults and more options).
 
 ### *Quick Checklist*
 

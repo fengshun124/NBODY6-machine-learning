@@ -182,18 +182,21 @@ class Shard:
 
     # I/O operations
     def to_npz(self, filepath: Path | str) -> None:
-        filepath = Path(filepath)
-        tmp_filepath = filepath.with_suffix(filepath.suffix + ".tmp")
+        filepath = Path(filepath).resolve()
+        # NumPy would silently append .npz if not present,
+        # thus the temporary file are named as 'xx.tmp.npz' to avoid unintended append.
+        tmp_filepath = filepath.with_suffix(".tmp" + filepath.suffix)
 
         try:
             np.savez_compressed(
-                filepath,
+                tmp_filepath,
                 feature=self._feature,
                 feature_keys=np.array(self._feature_keys, dtype="U"),
                 target=self._target,
                 target_keys=np.array(self._target_keys, dtype="U"),
                 ptr=self._ptr,
             )
+            tmp_filepath.replace(filepath)
         finally:
             tmp_filepath.unlink(missing_ok=True)
 

@@ -44,9 +44,9 @@ class NBODY6SnapshotDataset(Dataset):
             shard if isinstance(shard, Shard) else Shard.from_npz(Path(shard).resolve())
         )
 
-        # validate and cache feature keys
+        # validate and cache feature keys (store as tuple for consistency)
         self._feature_keys = (
-            [feature_keys] if isinstance(feature_keys, str) else list(feature_keys)
+            (feature_keys,) if isinstance(feature_keys, str) else tuple(feature_keys)
         )
         if not all(key in self._shard.feature_keys for key in self._feature_keys):
             raise ValueError(
@@ -98,7 +98,7 @@ class NBODY6SnapshotDataset(Dataset):
     def __len__(self) -> int:
         return self.n_snapshots * self._num_sample_per_snapshot
 
-    def __getitem__(self, index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def __getitem__(self, index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
         sample_idx = int(index % self._num_sample_per_snapshot)
         snapshot_idx = int(index // self._num_sample_per_snapshot)
 
@@ -156,7 +156,12 @@ class NBODY6SnapshotDataset(Dataset):
             sampled_features[:n_stars] = features
             valid_mask[:n_stars] = True
 
-        return sampled_features, np.array([target], dtype=np.float32), valid_mask
+        return (
+            sampled_features,
+            np.array([target], dtype=np.float32),
+            valid_mask,
+            index,
+        )
 
     @property
     def shard(self) -> Shard:
@@ -167,7 +172,7 @@ class NBODY6SnapshotDataset(Dataset):
         return len(self._shard)
 
     @property
-    def feature_keys(self) -> list[str]:
+    def feature_keys(self) -> tuple[str, ...]:
         return self._feature_keys
 
     @property
@@ -299,13 +304,14 @@ class NBODY6DataModule(pl.LightningDataModule):
 
     @staticmethod
     def _collate_fn(
-        batch: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        features, targets, masks = zip(*batch)
+        batch: list[tuple[np.ndarray, np.ndarray, np.ndarray, int]],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        features, targets, masks, sample_ids = zip(*batch)
         return (
             torch.from_numpy(np.stack(features)).float(),
             torch.from_numpy(np.stack(targets)).float().squeeze(-1),
             torch.from_numpy(np.stack(masks)).bool(),
+            torch.as_tensor(sample_ids).long(),
         )
 
     def _make_dataloader(self, dataset: Dataset, shuffle: bool) -> DataLoader:

@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 SplitType = Literal["train", "val", "test"]
 
 
-def _load_split_manifest(manifest_path: Path | str) -> dict:
+def _load_split_manifest(manifest_path: Path | str) -> dict[str, list[str]]:
     # load split manifest
     manifest_path = Path(manifest_path).resolve()
     if not manifest_path.exists():
@@ -117,10 +117,6 @@ def _merge_per_run_shards(
     if merged_shard_file.is_file():
         logger.info(f"[{split}] merged shard file exists, skip.")
         return
-    tmp_merged_shard_file = merged_shard_file.with_suffix(".tmp.npz")
-    if tmp_merged_shard_file.exists():
-        logger.debug(f"[{split}] removing temporary merged shard file ...")
-        tmp_merged_shard_file.unlink()
 
     try:
         cached_shard_files = sorted(
@@ -149,24 +145,19 @@ def _merge_per_run_shards(
                 _add,
                 (Shard.from_npz(shard_file) for shard_file in cached_shard_files),
             )
-        # atomic write
         logger.debug(f"[{split}] writing merged shard file ...")
-        merged_shard.to_npz(tmp_merged_shard_file)
-        tmp_merged_shard_file.replace(merged_shard_file)
+        merged_shard.to_npz(merged_shard_file)
         logger.info(f"[{split}] merged shard file created: {merged_shard_file}")
     except Exception as e:
         logger.exception(f"[{split}] Failed: {e!r}")
     finally:
-        if tmp_merged_shard_file.exists():
-            tmp_merged_shard_file.unlink()
-        # remove per-run shard files to save space (safe, no rmtree)
         per_run_dir = Path(dataset_dir) / split
         if per_run_dir.exists() and per_run_dir.is_dir():
             for child in per_run_dir.iterdir():
                 try:
                     if child.is_file() and (
                         child.name.endswith("-shard.npz")
-                        or child.name.endswith(".tmp.npz")
+                        or child.name.endswith(".npz.tmp")
                     ):
                         child.unlink()
                 except Exception:
@@ -204,10 +195,6 @@ def _scale_raw_shard(
     if scaled_shard_file.is_file():
         logger.info(f"[{split}] scaled shard exists, skip.")
         return
-    tmp_scaled_shard_file = scaled_shard_file.with_suffix(".tmp.npz")
-    if tmp_scaled_shard_file.exists():
-        logger.debug(f"[{split}] removing temporary scaled shard file ...")
-        tmp_scaled_shard_file.unlink()
 
     shard = None
     try:
@@ -227,14 +214,11 @@ def _scale_raw_shard(
         )
 
         logger.debug(f"[{split}] writing scaled shard file ...")
-        scaled_shard.to_npz(tmp_scaled_shard_file)
-        tmp_scaled_shard_file.replace(scaled_shard_file)
+        scaled_shard.to_npz(scaled_shard_file)
         logger.info(f"[{split}] scaled shard created: {scaled_shard_file}")
     except Exception as e:
         logger.exception(f"[{split}] Failed to scale shard: {e!r}")
     finally:
-        if tmp_scaled_shard_file.exists():
-            tmp_scaled_shard_file.unlink()
         del shard
         gc.collect()
 
