@@ -16,6 +16,17 @@ Python 3.12+ with the following packages (see [`requirements.txt`](./requirement
 - `torch`
 - `torchmetrics`
 - `tqdm`
+- `pyarrow`
+
+Optionally, for GPU monitoring during training, install [nvitop](https://github.com/XuehaiPan/nvitop):
+
+```bash
+# using conda (conda-forge)
+conda install -c conda-forge nvitop
+
+# or using pip
+pip install nvitop
+```
 
 ## Usage
 
@@ -75,19 +86,41 @@ CUDA_VISIBLE_DEVICES=0 python ./src/train.py \
   --num-workers 16 \
   -bs 20480 \
   -lr 1e-4 \
-  -wd 3e-3 \
-  --max-epochs 100
+  -wd 3e-3
 ```
 
-Key Options:
-- `--dataset`: path to the `dataset` folder created by `build_dataset.py`.
-- `--feature-keys`: repeatable; per-element input features (e.g., `x`, `y`, `z`, `vx`, `vy`, `vz`).
-- `--target-key`: regression target to predict.
-- `--model`: model architecture name (`set_transformer`, `deep_sets`, `summary_stats`).
-- `--hparam KEY=VALUE`: model hyperparameters (repeatable). Values accept Python literals (numbers, tuples, booleans).
-- `-lr` / `-wd`: shorthand for `--learning-rate` and `--weight-decay`.
+Run with `--help` to see all available options:
 
-Other useful flags: `--batch-size`, `--num-workers`, `--max-epochs`, `--patience`, `--seed` (see [`src/train.py`](./src/train.py) for defaults and more options).
+```bash
+python ./src/train.py --help
+```
+
+- Dataset and feature/target specification:
+
+  - `--dataset`: path to the `dataset` folder created by `build_dataset.py`.
+  - `--feature-keys`: repeatable; per-element input features (e.g., `x`, `y`, `z`, `vx`, `vy`, `vz`).
+  - `--target-key`: regression target to predict.
+  - `--num-star-per-sample`: number of stars per input set sample.
+  - `--num-sample-per-snapshot`: number of set samples drawn from each snapshot during training/validation/testing.
+  - `--drop-probability`: probability of dropping stars from samples when a snapshot contains more than `--num-star-per-sample` stars (default `0.6`).
+  - `--drop-ratio-range`: lower and upper bound (tuple) for the fraction of stars to drop when applying random star dropping (default `(0.1, 0.9)`).
+
+- Model selection and hyperparameters:
+
+  - `--model`: model architecture name (`set_transformer`, `deep_sets`, `summary_stats`).
+  - `--hparam KEY=VALUE`: model hyperparameters (repeatable). Values accept Python literals (numbers, tuples, booleans).
+  - `--huber-delta`: delta parameter used by the Huber loss during training (default `1.0`).
+
+- Training configuration:
+
+  - `--seed`: random seed for reproducibility.
+  - `-lr` / `-wd` / `-bs`: shorthand for `--learning-rate`, `--weight-decay`, `--batch-size`, respectively.
+  - `--num-workers`: number of DataLoader workers.
+  - `--pin-memory/--no-pin-memory`: toggle `pin_memory` for the DataLoader (default `--pin-memory`).
+  - `--max-epochs`: maximum number of training epochs.
+  - `--patience`: early stopping patience in epochs.
+
+See [`src/train.py`](./src/train.py) for full details on all options.
 
 ### *Quick Checklist*
 
@@ -103,6 +136,6 @@ The framework provides three permutation-invariant architectures for variable-si
 
 - [`SummaryStatsRegressor`](./src/model/summary_stats.py): computes descriptive statistics (e.g., mean, std, quantiles) across set features, then feeds them to an MLP for regression.
 
-- [`DeepSetsRegressor`](./src/model/deep_sets.py): applies a per-element encoder, aggregates via a permutation-invariant pooling (e.g., sum/mean), and decodes with an MLP following the [Deep Sets](https://arxiv.org/abs/1703.06114) design.
+- [`DeepSetRegressor`](./src/model/deep_set.py): applies a per-element encoder, aggregates via a permutation-invariant pooling (e.g., sum/mean), and decodes with an MLP following the [Deep Sets](https://arxiv.org/abs/1703.06114) design.
 
 - [`SetTransformerRegressor`](./src/model/set_transformer.py): uses attention-based [Set Transformer](https://arxiv.org/abs/1810.00825) blocks to model interactions among members before pooling and final MLP decoding.

@@ -5,6 +5,8 @@ from pathlib import Path
 import click
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytorch_lightning as pl
 import torch
 from dataset.module import NBODY6DataModule
@@ -84,6 +86,10 @@ def _build_model(
     input_feature_labels: tuple[str, ...],
     output_dim: int,
     output_target_label: str,
+    num_star_per_sample: int,
+    num_sample_per_snapshot: int,
+    drop_probability: float = 0.4,
+    drop_ratio_range: tuple[float, float] = (0.1, 0.9),
     batch_size: int = 5120,
     learning_rate: float = 1e-4,
     weight_decay: float = 3e-3,
@@ -132,16 +138,23 @@ def _build_model(
         case _:
             model_hparams = []
 
-    train_param = [
+    sampling_config = [
+        f"nstar{num_star_per_sample}",
+        f"nsnap{num_sample_per_snapshot}",
+        f"dp{_fmt_value(drop_probability)}",
+        f"dr{_fmt_value(drop_ratio_range[0])}_{_fmt_value(drop_ratio_range[1])}",
+    ]
+    training_config = [
         f"bs{batch_size}",
         f"lr{_fmt_value(learning_rate)}",
         f"wd{_fmt_value(weight_decay)}",
     ]
     version = "-".join(
         [f"from+{'+'.join(input_feature_labels)}", f"to+{output_target_label}"]
+        + sampling_config
         + [model_name]
         + model_hparams
-        + train_param
+        + training_config
     )
 
     orchestrator = LightningRegressionOrchestrator(
@@ -156,27 +169,52 @@ def _build_model(
     return orchestrator, version
 
 
-class TestNPZWriter(pl.Callback):
+class TestParquetWriter(pl.Callback):
     def __init__(
         self,
         output_file: Path | str,
+        merge_batch_rows: int = 65536,
     ) -> None:
         self._output_file = Path(output_file).resolve()
+        self._output_file_part: Path | None = None
 
-        self._sample_id_buffer = []
-        self._prediction_original_buffer = []
-        self._prediction_scaled_buffer = []
-        self._target_original_buffer = []
-        self._target_scaled_buffer = []
+        self._part_writer: pq.ParquetWriter | None = None
+        self._merge_batch_rows = int(merge_batch_rows)
+
+    @staticmethod
+    def _distributed_barrier(trainer: pl.Trainer) -> None:
+        if not (
+            torch.distributed.is_available() and torch.distributed.is_initialized()
+        ):
+            return
+
+        if torch.cuda.is_available():
+            device_id = getattr(trainer, "local_rank", None)
+            if device_id is None:
+                device_id = torch.cuda.current_device()
+            torch.distributed.barrier(device_ids=[int(device_id)])
+        else:
+            torch.distributed.barrier()
 
     def on_test_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        self._output_file.parent.mkdir(parents=True, exist_ok=True)
+        if trainer.is_global_zero:
+            self._output_file.parent.mkdir(parents=True, exist_ok=True)
+            if self._output_file.is_file():
+                self._output_file.unlink()
 
-        self._sample_id_buffer.clear()
-        self._prediction_original_buffer.clear()
-        self._prediction_scaled_buffer.clear()
-        self._target_original_buffer.clear()
-        self._target_scaled_buffer.clear()
+        self._distributed_barrier(trainer=trainer)
+
+        if getattr(trainer, "world_size", 1) > 1:
+            self._output_file_part = self._output_file.with_suffix(
+                f".ddp-rank{trainer.global_rank}" + self._output_file.suffix
+            )
+        else:
+            self._output_file_part = self._output_file
+
+        if self._output_file_part.is_file():
+            self._output_file_part.unlink()
+
+        self._part_writer = None
 
     def on_test_batch_end(
         self,
@@ -189,45 +227,86 @@ class TestNPZWriter(pl.Callback):
     ) -> None:
         predictions_scaled, targets_scaled, sample_ids = outputs
 
-        predictions_scaled_np = predictions_scaled.detach().cpu().numpy()
-        targets_scaled_np = targets_scaled.detach().cpu().numpy()
-        sample_ids_np = sample_ids.detach().cpu().numpy()
-
         data_module = trainer.datamodule
-        predictions_original_np = data_module.inverse_transform_targets(
-            predictions_scaled_np
-        )
-        targets_original_np = data_module.inverse_transform_targets(targets_scaled_np)
 
-        self._sample_id_buffer.append(sample_ids_np)
-        self._prediction_scaled_buffer.append(predictions_scaled_np)
-        self._target_scaled_buffer.append(targets_scaled_np)
-        self._prediction_original_buffer.append(predictions_original_np)
-        self._target_original_buffer.append(targets_original_np)
+        table = pa.table(
+            {
+                "sample_id": (
+                    sample_ids_np := sample_ids.detach()
+                    .cpu()
+                    .numpy()
+                    .reshape(-1)
+                    .astype(np.int64)
+                ),
+                "prediction_scaled": (
+                    predictions_scaled_np := predictions_scaled.detach()
+                    .cpu()
+                    .numpy()
+                    .reshape(-1)
+                ),
+                "target_scaled": (
+                    targets_scaled_np := targets_scaled.detach()
+                    .cpu()
+                    .numpy()
+                    .reshape(-1)
+                ),
+                "prediction_original": data_module.inverse_transform_targets(
+                    predictions_scaled_np.reshape(-1, 1)
+                ).reshape(-1),
+                "target_original": data_module.inverse_transform_targets(
+                    targets_scaled_np.reshape(-1, 1)
+                ).reshape(-1),
+            }
+        )
+
+        if self._part_writer is None:
+            self._part_writer = pq.ParquetWriter(self._output_file_part, table.schema)
+        self._part_writer.write_table(table)
+
+        logger.debug(
+            f"Written test batch {batch_idx} with {len(sample_ids_np)} samples to {self._output_file_part}"
+        )
 
     def on_test_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        sample_ids = np.concatenate(self._sample_id_buffer, axis=0)
-        predictions_scaled = np.concatenate(self._prediction_scaled_buffer, axis=0)
-        targets_scaled = np.concatenate(self._target_scaled_buffer, axis=0)
-        predictions_original = np.concatenate(self._prediction_original_buffer, axis=0)
-        targets_original = np.concatenate(self._target_original_buffer, axis=0)
+        if self._part_writer is not None:
+            self._part_writer.close()
+            self._part_writer = None
 
-        np.savez_compressed(
-            self._output_file,
-            sample_id=sample_ids,
-            prediction_scaled=predictions_scaled,
-            target_scaled=targets_scaled,
-            prediction_original=predictions_original,
-            target_original=targets_original,
-        )
+        self._distributed_barrier(trainer=trainer)
 
+        if trainer.is_global_zero and getattr(trainer, "world_size", 1) > 1:
+            # merge all part files into ONE parquet (streaming)
+            part_files = [
+                self._output_file.with_suffix(
+                    f".ddp-rank{rank}" + self._output_file.suffix
+                )
+                for rank in range(trainer.world_size)
+            ]
+
+            schema = pq.ParquetFile(part_files[0]).schema_arrow
+            with pq.ParquetWriter(self._output_file, schema) as writer:
+                for pf in part_files:
+                    parquet_file = pq.ParquetFile(pf)
+                    for batch in parquet_file.iter_batches(
+                        batch_size=self._merge_batch_rows
+                    ):
+                        writer.write_table(
+                            pa.Table.from_batches([batch], schema=schema)
+                        )
+
+            # cleanup
+            for pf in part_files:
+                try:
+                    pf.unlink()
+                except OSError:
+                    pass
+
+            logger.info(
+                f"Concatenated test results to: {self._output_file} from {trainer.world_size} part files."
+            )
+
+        self._distributed_barrier(trainer=trainer)
         logger.info(f"Test results saved to: {self._output_file}")
-
-        self._sample_id_buffer.clear()
-        self._prediction_original_buffer.clear()
-        self._prediction_scaled_buffer.clear()
-        self._target_original_buffer.clear()
-        self._target_scaled_buffer.clear()
 
 
 @click.command()
@@ -274,6 +353,41 @@ class TestNPZWriter(pl.Callback):
     "hparam_pairs",
     multiple=True,
     help="Model hparam. Example: --hparam hidden_dim=64",
+)
+@click.option(
+    "--num-star-per-sample",
+    type=click.IntRange(min=1),
+    default=128,
+    show_default=True,
+    help="Number of stars per sample.",
+)
+@click.option(
+    "--num-sample-per-snapshot",
+    type=click.IntRange(min=1),
+    default=16,
+    show_default=True,
+    help="Number of samples per snapshot.",
+)
+@click.option(
+    "--drop-probability",
+    type=click.FloatRange(min=0.0, max=1.0),
+    default=0.6,
+    show_default=True,
+    help="Probability of dropping stars from samples if there are more stars than num_star_per_sample.",
+)
+@click.option(
+    "--drop-ratio-range",
+    type=click.Tuple([click.FloatRange(0.0, 1.0), click.FloatRange(0.0, 1.0)]),
+    default=(0.1, 0.9),
+    show_default=True,
+    callback=lambda ctx, param, value: value
+    if value[0] <= value[1]
+    else (_ for _ in ()).throw(
+        click.BadParameter(
+            f"Expected lower bound <= upper bound for drop ratio range, got {value}"
+        )
+    ),
+    help="Range of ratio of stars to drop when applying random star dropping.",
 )
 @click.option(
     "--num-workers",
@@ -345,6 +459,10 @@ def train(
     feature_keys: tuple[str, ...],
     target_key: str,
     hparam_pairs: tuple[str, ...],
+    num_star_per_sample: int,
+    num_sample_per_snapshot: int,
+    drop_probability: float,
+    drop_ratio_range: tuple[float, float],
     num_workers: int,
     pin_memory: bool,
     batch_size: int,
@@ -354,6 +472,8 @@ def train(
     max_epochs: int,
     patience: int,
 ) -> None:
+    setup_logger(OUTPUT_BASE / "log" / "train.log")
+    
     pl.seed_everything(seed, workers=True)
     parsed_hparams = _parse_hparams(hparam_pairs)
 
@@ -367,7 +487,10 @@ def train(
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        num_sample_per_snapshot=12,
+        num_star_per_sample=num_star_per_sample,
+        num_sample_per_snapshot=num_sample_per_snapshot,
+        drop_probability=drop_probability,
+        drop_ratio_range=drop_ratio_range,
         feature_keys=feature_keys,
         target_key=target_key,
     )
@@ -379,6 +502,10 @@ def train(
         input_feature_labels=data_module.feature_keys,
         output_dim=data_module.target_dim,
         output_target_label=data_module.target_key,
+        num_star_per_sample=num_star_per_sample,
+        num_sample_per_snapshot=num_sample_per_snapshot,
+        drop_probability=drop_probability,
+        drop_ratio_range=drop_ratio_range,
         model_hparams=parsed_hparams,
         batch_size=batch_size,
         learning_rate=learning_rate,
@@ -418,9 +545,11 @@ def train(
                 mode="min",
                 strict=True,
             ),
-            TestNPZWriter(
+            TestParquetWriter(
                 output_file=(
-                    test_npz_file := (output_dir / f"{version_str}-test.npz").resolve()
+                    test_parquet_file := (
+                        output_dir / f"{version_str}-test.parquet"
+                    ).resolve()
                 ),
             ),
         ],
@@ -429,22 +558,13 @@ def train(
     trainer.fit(orchestrator, datamodule=data_module)
     trainer.test(orchestrator, datamodule=data_module, ckpt_path="best")
 
-    # load the test results and print samples
+    # load the test results (Parquet) and print samples
     try:
-        with np.load(test_npz_file) as npz:
-            df = pd.DataFrame(
-                {
-                    "sample_id": npz["sample_id"],
-                    "prediction_original": npz["prediction_original"].flatten(),
-                    "target_original": npz["target_original"].flatten(),
-                    "prediction_scaled": npz["prediction_scaled"].flatten(),
-                    "target_scaled": npz["target_scaled"].flatten(),
-                }
-            )
+        df = pd.read_parquet(test_parquet_file)
         logger.info("Test Results Samples:")
         logger.info("\n%s", df.head(10).to_string(index=False))
     except Exception as e:
-        logger.error(f"Failed to load test results from {test_npz_file}: {e}")
+        logger.error(f"Failed to load test results from {test_parquet_file}: {e}")
 
 
 if __name__ == "__main__":
