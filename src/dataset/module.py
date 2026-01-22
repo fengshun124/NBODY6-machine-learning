@@ -98,7 +98,9 @@ class NBODY6SnapshotDataset(Dataset):
     def __len__(self) -> int:
         return self.n_snapshots * self._num_sample_per_snapshot
 
-    def __getitem__(self, index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    def __getitem__(
+        self, index: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
         sample_idx = int(index % self._num_sample_per_snapshot)
         snapshot_idx = int(index // self._num_sample_per_snapshot)
 
@@ -160,7 +162,8 @@ class NBODY6SnapshotDataset(Dataset):
             sampled_features,
             np.array([target], dtype=np.float32),
             valid_mask,
-            index,
+            snapshot_idx,
+            sample_idx,
         )
 
     @property
@@ -304,14 +307,15 @@ class NBODY6DataModule(pl.LightningDataModule):
 
     @staticmethod
     def _collate_fn(
-        batch: list[tuple[np.ndarray, np.ndarray, np.ndarray, int]],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        features, targets, masks, sample_ids = zip(*batch)
+        batch: list[tuple[np.ndarray, np.ndarray, np.ndarray, int, int]],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        features, targets, masks, snapshot_indices, sample_indices = zip(*batch)
         return (
-            torch.from_numpy(np.stack(features)).float(),
-            torch.from_numpy(np.stack(targets)).float().squeeze(-1),
-            torch.from_numpy(np.stack(masks)).bool(),
-            torch.as_tensor(sample_ids).long(),
+            torch.from_numpy(np.stack(features, axis=0)),
+            torch.from_numpy(np.stack(targets, axis=0)),
+            torch.from_numpy(np.stack(masks, axis=0)),
+            torch.from_numpy(np.array(snapshot_indices, dtype=np.int64)),
+            torch.from_numpy(np.array(sample_indices, dtype=np.int64)),
         )
 
     def _make_dataloader(self, dataset: Dataset, shuffle: bool) -> DataLoader:

@@ -3,7 +3,7 @@ from typing import Any, Type
 import pytorch_lightning as pl
 import torch
 from torch import nn
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
 from torchmetrics import MeanAbsoluteError, MeanSquaredError
 
@@ -14,8 +14,9 @@ class LightningRegressionOrchestrator(pl.LightningModule):
         regressor: nn.Module | Type[nn.Module],
         hyperparameters: dict[str, Any],
         huber_delta: float = 1.0,
-        learning_rate: float = 1e-3,
+        learning_rate: float = 3e-3,
         weight_decay: float = 1e-4,
+        lr_scheduler_t_max: int = 50,
         seed: int = 42,
     ) -> None:
         super().__init__()
@@ -26,6 +27,7 @@ class LightningRegressionOrchestrator(pl.LightningModule):
                 "weight_decay": weight_decay,
                 "model_hparams": hyperparameters,
                 "loss_huber_delta": huber_delta,
+                "lr_scheduler_t_max": lr_scheduler_t_max,
                 "seed": seed,
             }
         )
@@ -52,9 +54,13 @@ class LightningRegressionOrchestrator(pl.LightningModule):
         return self.model(X, mask)
 
     def _evaluation(
-        self, batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], stage: str
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        inputs, targets, mask, sample_ids = batch
+        self,
+        batch: tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+        ],
+        stage: str,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        inputs, targets, mask, snapshot_ids, sample_ids = batch
         mask = mask.bool()
 
         predictions = self(inputs, mask).view(-1)
@@ -83,10 +89,10 @@ class LightningRegressionOrchestrator(pl.LightningModule):
                 sync_dist=True,
             )
 
-        return loss, predictions, targets, sample_ids
+        return loss, predictions, targets, snapshot_ids, sample_ids
 
     def training_step(self, batch, batch_idx) -> torch.Tensor:
-        loss, _, _, _ = self._evaluation(batch=batch, stage="train")
+        loss, _, _, _, _ = self._evaluation(batch=batch, stage="train")
         return loss
 
     def validation_step(self, batch, batch_idx) -> None:
@@ -94,11 +100,11 @@ class LightningRegressionOrchestrator(pl.LightningModule):
 
     def test_step(
         self, batch, batch_idx
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        _, predictions, targets, sample_ids = self._evaluation(
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        _, predictions, targets, snapshot_ids, sample_ids = self._evaluation(
             batch=batch, stage="test"
         )
-        return predictions, targets, sample_ids
+        return predictions, targets, snapshot_ids, sample_ids
 
     def configure_optimizers(self) -> dict[str, Any]:
         optimizer = torch.optim.AdamW(
@@ -107,18 +113,16 @@ class LightningRegressionOrchestrator(pl.LightningModule):
             weight_decay=self.hparams.weight_decay,
         )
 
-        scheduler = ReduceLROnPlateau(
+        scheduler = CosineAnnealingLR(
             optimizer=optimizer,
-            mode="min",
-            factor=0.5,
-            patience=10,
+            T_max=self.hparams.lr_scheduler_t_max,
+            eta_min=self.hparams.learning_rate * 1e-3,
         )
 
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "val_huber_loss",
                 "interval": "epoch",
                 "frequency": 1,
             },
@@ -143,9 +147,11 @@ class ToySetDataset(Dataset):
         self.data = torch.randn(num_samples, max_set_size, input_dim)
 
         self.set_sizes = torch.randint(1, max_set_size + 1, (num_samples,))
-        self.masks = torch.arange(max_set_size).expand(
-            num_samples, max_set_size
-        ) < self.set_sizes.unsqueeze(1)
+
+        self.masks = (
+            torch.arange(max_set_size).unsqueeze(0).expand(num_samples, max_set_size)
+            < self.set_sizes.unsqueeze(1)
+        ).bool()
 
         # mock targets: mean of valid elements in the first dimension
         self.targets = torch.zeros(num_samples, 1)
@@ -171,8 +177,16 @@ class ToySetDataset(Dataset):
     def __len__(self) -> int:
         return self.num_samples
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.data[idx], self.norm_targets[idx], self.masks[idx]
+    def __getitem__(
+        self, idx: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            self.data[idx],
+            self.norm_targets[idx],
+            self.masks[idx],
+            torch.tensor(idx, dtype=torch.int64),
+            torch.tensor(0, dtype=torch.int64),
+        )
 
 
 class ToySetDataModule(pl.LightningDataModule):
@@ -296,7 +310,7 @@ if __name__ == "__main__":
             "num_sabs": 2,
             "output_hidden_dims": (8,),
         },
-        learning_rate=1e-3,
+        learning_rate=3e-3,
         seed=SEED,
     )
 
@@ -335,7 +349,7 @@ if __name__ == "__main__":
     toy_data_module.setup()
     test_loader = toy_data_module.test_dataloader()
     dummy_batch = next(iter(test_loader))
-    x, y_norm, mask = dummy_batch
+    x, y_norm, mask, snapshot_ids, sample_ids = dummy_batch
 
     orchestrator.eval()
     with torch.no_grad():

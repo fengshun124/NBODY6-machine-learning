@@ -1,5 +1,7 @@
 import ast
 import logging
+import os
+import platform
 from pathlib import Path
 
 import click
@@ -12,7 +14,11 @@ import torch
 from dataset.module import NBODY6DataModule
 from model import DeepSetRegressor, SetTransformerRegressor, SummaryStatsRegressor
 from orchestrator import LightningRegressionOrchestrator
-from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning.callbacks import (
+    EarlyStopping,
+    LearningRateMonitor,
+    ModelCheckpoint,
+)
 from pytorch_lightning.loggers import CSVLogger
 from utils import OUTPUT_BASE, setup_logger
 
@@ -21,7 +27,7 @@ logger = logging.getLogger(__name__)
 torch.set_float32_matmul_precision("medium")
 
 
-# model and their default hyperparameters
+# models and their default hyperparameters
 MODEL_REGISTRY: dict[str, dict[str, object]] = {
     "set_transformer": {
         "class": SetTransformerRegressor,
@@ -91,10 +97,11 @@ def _build_model(
     drop_probability: float = 0.4,
     drop_ratio_range: tuple[float, float] = (0.1, 0.9),
     batch_size: int = 5120,
-    learning_rate: float = 1e-4,
-    weight_decay: float = 3e-3,
+    learning_rate: float = 3e-3,
+    weight_decay: float = 1e-4,
     huber_delta: float = 1.0,
-    seed: int | None = None,
+    max_epochs: int = 50,
+    seed: int = 42,
 ) -> tuple[pl.LightningModule, str]:
     model_name = model_name.lower()
     if model_name not in MODEL_REGISTRY:
@@ -163,6 +170,7 @@ def _build_model(
         huber_delta=huber_delta,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
+        lr_scheduler_t_max=max_epochs,
         seed=seed,
     )
 
@@ -183,20 +191,30 @@ class TestParquetWriter(pl.Callback):
 
     @staticmethod
     def _distributed_barrier(trainer: pl.Trainer) -> None:
-        if not (
-            torch.distributed.is_available() and torch.distributed.is_initialized()
-        ):
+        try:
+            trainer.strategy.barrier()
             return
+        except Exception:
+            pass
 
-        if torch.cuda.is_available():
-            device_id = getattr(trainer, "local_rank", None)
-            if device_id is None:
-                device_id = torch.cuda.current_device()
-            torch.distributed.barrier(device_ids=[int(device_id)])
-        else:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            local_rank = getattr(trainer, "local_rank", None)
+            if torch.cuda.is_available() and local_rank is not None:
+                try:
+                    torch.distributed.barrier(device_ids=[local_rank])
+                    return
+                except TypeError:
+                    pass
+
             torch.distributed.barrier()
 
     def on_test_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if (
+            torch.cuda.is_available()
+            and getattr(trainer, "local_rank", None) is not None
+        ):
+            torch.cuda.set_device(trainer.local_rank)
+
         if trainer.is_global_zero:
             self._output_file.parent.mkdir(parents=True, exist_ok=True)
             if self._output_file.is_file():
@@ -220,17 +238,26 @@ class TestParquetWriter(pl.Callback):
         self,
         trainer: pl.Trainer,
         pl_module: pl.LightningModule,
-        outputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        outputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        batch: tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+        ],
         batch_idx: int,
         dataloader_idx: int = 0,
     ) -> None:
-        predictions_scaled, targets_scaled, sample_ids = outputs
+        predictions_scaled, targets_scaled, snapshot_ids, sample_ids = outputs
 
         data_module = trainer.datamodule
 
         table = pa.table(
             {
+                "snapshot_id": (
+                    snapshot_ids_np := snapshot_ids.detach()
+                    .cpu()
+                    .numpy()
+                    .reshape(-1)
+                    .astype(np.int64)
+                ),
                 "sample_id": (
                     sample_ids_np := sample_ids.detach()
                     .cpu()
@@ -264,7 +291,7 @@ class TestParquetWriter(pl.Callback):
         self._part_writer.write_table(table)
 
         logger.debug(
-            f"Written test batch {batch_idx} with {len(sample_ids_np)} samples to {self._output_file_part}"
+            f"[Test batch {batch_idx}] Wrote {len(snapshot_ids_np)} snapshots totaling {len(sample_ids_np)} samples to {self._output_file_part}"
         )
 
     def on_test_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
@@ -306,7 +333,8 @@ class TestParquetWriter(pl.Callback):
             )
 
         self._distributed_barrier(trainer=trainer)
-        logger.info(f"Test results saved to: {self._output_file}")
+        if trainer.is_global_zero:
+            logger.info(f"Test results saved to: {self._output_file}")
 
 
 @click.command()
@@ -416,7 +444,7 @@ class TestParquetWriter(pl.Callback):
     "--learning-rate",
     "learning_rate",
     type=float,
-    default=1e-4,
+    default=3e-3,
     show_default=True,
     help="Learning rate.",
 )
@@ -425,7 +453,7 @@ class TestParquetWriter(pl.Callback):
     "--weight-decay",
     "weight_decay",
     type=float,
-    default=3e-3,
+    default=1e-4,
     show_default=True,
     help="Weight decay.",
 )
@@ -448,7 +476,7 @@ class TestParquetWriter(pl.Callback):
 @click.option(
     "--patience",
     type=int,
-    default=5,
+    default=10,
     show_default=True,
     help="Early stopping patience when no improvement in validation loss.",
 )
@@ -473,7 +501,7 @@ def train(
     patience: int,
 ) -> None:
     setup_logger(OUTPUT_BASE / "log" / "train.log")
-    
+
     pl.seed_everything(seed, workers=True)
     parsed_hparams = _parse_hparams(hparam_pairs)
 
@@ -511,6 +539,7 @@ def train(
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         huber_delta=huber_delta,
+        max_epochs=max_epochs,
         seed=seed,
     )
     logger.info(f"Model Version: {version_str}")
@@ -518,10 +547,19 @@ def train(
     output_dir = OUTPUT_BASE / "experiments" / version_str
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info("Model Architecture:\n%s", orchestrator.model)
+    num_devices = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    if torch.cuda.is_available():
+        names = [torch.cuda.get_device_name(i) for i in range(num_devices)]
+        logger.info(f"Using GPU(s): count={num_devices}, names={names}")
+    else:
+        cpu_count = os.cpu_count()
+        cpu_spec = platform.processor() or platform.machine() or "Unknown"
+        logger.info(f"Using CPU: count={cpu_count}, spec={cpu_spec}")
 
     trainer = pl.Trainer(
-        accelerator="auto",
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
+        devices=num_devices,
+        strategy="ddp" if num_devices > 1 else "auto",
         max_epochs=max_epochs,
         gradient_clip_val=0.5,
         log_every_n_steps=100,
@@ -545,6 +583,11 @@ def train(
                 mode="min",
                 strict=True,
             ),
+            LearningRateMonitor(
+                logging_interval="epoch",
+                log_momentum=True,
+                log_weight_decay=True,
+            ),
             TestParquetWriter(
                 output_file=(
                     test_parquet_file := (
@@ -555,16 +598,30 @@ def train(
         ],
     )
 
-    trainer.fit(orchestrator, datamodule=data_module)
+    if trainer.is_global_zero:
+        logger.info("Model Architecture:\n%s", orchestrator.model)
+
+    # resume from checkpoint if available
+    if ckpt_files := sorted(
+        output_dir.glob(f"checkpoint-{version_str}-*.ckpt"),
+        key=lambda p: p.stat().st_mtime,
+    ):
+        resume_ckpt = str(ckpt_files[-1])
+        logger.info(f"Found checkpoint, resuming from: {resume_ckpt}")
+        trainer.fit(orchestrator, datamodule=data_module, ckpt_path=resume_ckpt)
+    else:
+        trainer.fit(orchestrator, datamodule=data_module)
+
     trainer.test(orchestrator, datamodule=data_module, ckpt_path="best")
 
     # load the test results (Parquet) and print samples
-    try:
-        df = pd.read_parquet(test_parquet_file)
-        logger.info("Test Results Samples:")
-        logger.info("\n%s", df.head(10).to_string(index=False))
-    except Exception as e:
-        logger.error(f"Failed to load test results from {test_parquet_file}: {e}")
+    if trainer.is_global_zero:
+        try:
+            df = pd.read_parquet(test_parquet_file)
+            logger.info("Test Results Samples:")
+            logger.info("\n%s", df.sample(10).to_string(index=False))
+        except Exception as e:
+            logger.error(f"Failed to load test results from {test_parquet_file}: {e}")
 
 
 if __name__ == "__main__":
