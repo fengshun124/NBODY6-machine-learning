@@ -12,6 +12,8 @@ class Shard:
         feature_keys: tuple[str, ...] | str,
         target: np.ndarray,
         target_keys: tuple[str, ...] | str,
+        meta: np.ndarray,
+        meta_keys: tuple[str, ...] | str,
         ptr: np.ndarray,
     ) -> None:
         # feature in 2D array (n_sample x feature_dim)
@@ -30,6 +32,14 @@ class Shard:
             tuple([target_keys]) if isinstance(target_keys, str) else tuple(target_keys)
         )
 
+        # meta in 2D array (n_sample x meta_dim)
+        self._meta = (lambda m: m if m.ndim != 1 else m.reshape(-1, 1))(
+            np.asarray(meta, dtype=np.float32, order="C")
+        )
+        self._meta_keys = (
+            tuple([meta_keys]) if isinstance(meta_keys, str) else tuple(meta_keys)
+        )
+
         # pointer array (n_sample + 1,)
         self._ptr = np.asarray(ptr, dtype=np.int64)
 
@@ -45,6 +55,8 @@ class Shard:
             raise ValueError(
                 f"Expected target to be 2D, got shape={self._target.shape}"
             )
+        if self._meta.ndim != 2:
+            raise ValueError(f"Expected meta to be 2D, got shape={self._meta.shape}")
         if self._ptr.ndim != 1 or self._ptr.size < 2:
             raise ValueError("ptr must be 1D with length >= 2")
 
@@ -56,6 +68,10 @@ class Shard:
         if (target_dim := self._target.shape[1]) != len(self._target_keys):
             raise ValueError(
                 f"Expected target dimension {len(self._target_keys)}, got {target_dim}."
+            )
+        if (meta_dim := self._meta.shape[1]) != len(self._meta_keys):
+            raise ValueError(
+                f"Expected meta dimension {len(self._meta_keys)}, got {meta_dim}."
             )
 
         # check ptr consistency
@@ -72,12 +88,18 @@ class Shard:
             )
         if (n_sample := self._target.shape[0]) != (self._ptr.shape[0] - 1):
             raise ValueError(f"Expected samples {len(self)} sample(s), got {n_sample}.")
+        if self._meta.shape[0] != (self._ptr.shape[0] - 1):
+            raise ValueError(
+                f"Expected meta to have {self._ptr.shape[0] - 1} samples, "
+                f"got {self._meta.shape[0]}."
+            )
 
     def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}("
             f"feature_keys={self._feature_keys}, "
             f"target_keys={self._target_keys}, "
+            f"meta_keys={self._meta_keys}, "
             f"n_samples={len(self)}, "
             f"n_total_star={self._feature.shape[0]}"
             ")"
@@ -111,21 +133,34 @@ class Shard:
         return self._target.shape[1]
 
     @property
+    def meta(self) -> np.ndarray:
+        return self._meta.copy()
+
+    @property
+    def meta_keys(self) -> tuple[str, ...]:
+        return self._meta_keys
+
+    @property
+    def meta_dim(self) -> int:
+        return self._meta.shape[1]
+
+    @property
     def pointer(self) -> np.ndarray:
         return self._ptr.copy()
 
-    def __getitem__(self, idx: int) -> tuple[np.ndarray, np.ndarray]:
+    def __getitem__(self, idx: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         return (
             self._feature[self._ptr[idx] : self._ptr[idx + 1]].copy(),
             self._target[idx].copy(),
+            self._meta[idx].copy(),
         )
 
-    def __iter__(self) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+    def __iter__(self) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]:
         for i in range(len(self)):
             yield self[i]
 
     @property
-    def snapshots(self) -> list[tuple[np.ndarray, np.ndarray]]:
+    def snapshots(self) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
         warnings.warn(
             "Materializing all snapshots may consume large memory; prefer iteration.",
             UserWarning,
@@ -139,29 +174,33 @@ class Shard:
             return False
         if self._target_keys != other._target_keys:
             return False
+        if self._meta_keys != other._meta_keys:
+            return False
         return True
 
     # merge two compatible SplitShard instances
     def _merged_arrays(
         self, other: "Shard"
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         if not self._is_compatibility(other):
             raise ValueError("Incompatible SplitShard instances.")
 
         offset = int(self._ptr[-1])
         new_feature = np.concatenate([self._feature, other._feature], axis=0)
         new_target = np.concatenate([self._target, other._target], axis=0)
+        new_meta = np.concatenate([self._meta, other._meta], axis=0)
         new_ptr = np.concatenate([self._ptr, other._ptr[1:] + offset], axis=0).astype(
             np.int64, copy=False
         )
 
-        return new_feature, new_target, new_ptr
+        return new_feature, new_target, new_meta, new_ptr
 
     # A.extend(B)
     def extend(self, other: "Shard") -> None:
-        new_feature, new_target, new_ptr = self._merged_arrays(other)
+        new_feature, new_target, new_meta, new_ptr = self._merged_arrays(other)
         self._feature = new_feature
         self._target = new_target
+        self._meta = new_meta
         self._ptr = new_ptr
 
     # A += B
@@ -171,12 +210,14 @@ class Shard:
 
     # C = A + B
     def __add__(self, other: "Shard") -> "Shard":
-        new_feature, new_target, new_ptr = self._merged_arrays(other)
+        new_feature, new_target, new_meta, new_ptr = self._merged_arrays(other)
         return Shard(
             feature=new_feature,
             feature_keys=self._feature_keys,
             target=new_target,
             target_keys=self._target_keys,
+            meta=new_meta,
+            meta_keys=self._meta_keys,
             ptr=new_ptr,
         )
 
@@ -194,6 +235,8 @@ class Shard:
                 feature_keys=np.array(self._feature_keys, dtype="U"),
                 target=self._target,
                 target_keys=np.array(self._target_keys, dtype="U"),
+                meta=self._meta,
+                meta_keys=np.array(self._meta_keys, dtype="U"),
                 ptr=self._ptr,
             )
             tmp_filepath.replace(filepath)
@@ -212,6 +255,8 @@ class Shard:
             feature_keys=tuple(npz["feature_keys"].tolist()),
             target=npz["target"],
             target_keys=tuple(npz["target_keys"].tolist()),
+            meta=npz["meta"],
+            meta_keys=tuple(npz["meta_keys"].tolist()),
             ptr=npz["ptr"],
         )
 
@@ -221,5 +266,7 @@ class Shard:
             "feature_keys": self._feature_keys,
             "target": self._target,
             "target_keys": self._target_keys,
+            "meta": self._meta,
+            "meta_keys": self._meta_keys,
             "ptr": self._ptr,
         }

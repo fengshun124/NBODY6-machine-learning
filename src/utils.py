@@ -8,7 +8,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-OUTPUT_BASE = Path(os.getenv("OUTPUT_BASE")).resolve()
+OUTPUT_BASE_ENV = os.getenv("OUTPUT_BASE")
+if OUTPUT_BASE_ENV is None:
+    raise EnvironmentError("OUTPUT_BASE environment variable is not set.")
+OUTPUT_BASE = Path(OUTPUT_BASE_ENV)
 
 
 def setup_logger(log_file: Path | str) -> None:

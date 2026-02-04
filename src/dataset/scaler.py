@@ -24,6 +24,9 @@ NormMethod = Literal[
     "log10_minmax",  # log10 then min-max
     "power",  # PowerTransformer (Yeo-Johnson), handles negative values
     "quantile",  # QuantileTransformer, maps to uniform/normal distribution
+    "asinh",  # inverse hyperbolic sine transformation
+    "asinh_standard",  # asinh then standard
+    "asinh_minmax",  # asinh then min-max
     "identity",  # no transformation
 ]
 
@@ -37,6 +40,9 @@ NORM_METHODS: tuple[str, ...] = (
     "log10_minmax",
     "power",
     "quantile",
+    "asinh",
+    "asinh_standard",
+    "asinh_minmax",
     "identity",
 )
 NORM_METHODS_SET = frozenset(NORM_METHODS)
@@ -58,6 +64,14 @@ def _log10_transform(x):
 
 def _log10_inverse(x):
     return np.clip(np.power(10.0, x) - EPS, 0, None)
+
+
+def _asinh_transform(x):
+    return np.arcsinh(x)
+
+
+def _asinh_inverse(x):
+    return np.sinh(x)
 
 
 class ArrayScaler:
@@ -112,6 +126,30 @@ class ArrayScaler:
                         ("scale", scaler),
                     ]
                 )
+            case _ if method.startswith("asinh"):
+                if method == "asinh":
+                    return method, FunctionTransformer(
+                        func=_asinh_transform,
+                        inverse_func=_asinh_inverse,
+                        validate=True,
+                    )
+                else:
+                    scaler = (
+                        StandardScaler() if "standard" in method else MinMaxScaler()
+                    )
+                    return method, Pipeline(
+                        [
+                            (
+                                "asinh",
+                                FunctionTransformer(
+                                    func=_asinh_transform,
+                                    inverse_func=_asinh_inverse,
+                                    validate=True,
+                                ),
+                            ),
+                            ("scale", scaler),
+                        ]
+                    )
             case _:
                 warnings.warn(
                     f"Unknown normalization method '{method}'. Using 'identity'."
@@ -293,6 +331,19 @@ if __name__ == "__main__":
     rec_data = bundle.inverse_transform(bundle.transform(data, keys), keys)
     assert np.allclose(data, rec_data)
     print("Reconstruction successful!")
+
+    data_with_negatives = (np.random.rand(500, len(keys)) - 0.5) * 20
+    asinh_scalers = [
+        ("asinh", ArrayScaler("asinh")),
+        ("asinh_standard", ArrayScaler("asinh_standard")),
+        ("asinh_minmax", ArrayScaler("asinh_minmax")),
+    ]
+    for name, scaler in asinh_scalers:
+        scaler.fit(data_with_negatives)
+        transformed = scaler.transform(data_with_negatives)
+        reconstructed = scaler.inverse_transform(transformed)
+        assert np.allclose(data_with_negatives, reconstructed, rtol=1e-10)
+        print(f"{name} method: Reconstruction successful!")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         config_path = Path(tmpdir) / "scaler_bundle.joblib"

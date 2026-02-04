@@ -36,7 +36,6 @@ Create a `.env` file from the [`.env.template`](.env.template) and set the requi
 
 - `OUTPUT_BASE` (where pipeline/dataset/train outputs are written)
 - `JOBLIB_ROOT` (joblib cache root used by the NBODY6 data pipeline)
-- `SPLIT_MFT_JSON` (path to split manifest used by `build_dataset.py`)
 
 ```bash
 # Edit .env and set the variables listed above
@@ -48,7 +47,7 @@ cp .env.template .env
 Build the cached, scaled dataset from NBODY6 pipeline joblib caches. Run this from the `machine-learning` directory:
 
 ```bash
-python ./src/build_dataset.py
+python ./src/build_dataset.py --split-mft-json /path/to/split/manifest.json
 ```
 
 Outputs produced under `OUTPUT_BASE/dataset/`:
@@ -59,7 +58,7 @@ Outputs produced under `OUTPUT_BASE/dataset/`:
 
 Notes:
 
-- The script reads the split manifest at `SPLIT_MFT_JSON` and joblib caches under `JOBLIB_ROOT` (see NBODY6-data-pipeline for cache layout).
+- The script expects a split manifest passed via `--split-mft-json` (see [NBODY6-data-pipeline/notebooks/dataset_split.ipynb](https://github.com/fengshun124/NBODY6-data-pipeline/blob/main/notebooks/dataset_split.ipynb) for manifest generation) and loads joblib caches from the directory specified by `JOBLIB_ROOT` in `.env` file (see [NBODY6-data-pipeline/README.md](https://github.com/fengshun124/NBODY6-data-pipeline/blob/main/README.md) for details).
 - If you customize feature/target keys or scaler configuration, update the call or the env vars accordingly.
 
 ### Train a model

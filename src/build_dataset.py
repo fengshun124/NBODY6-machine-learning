@@ -2,10 +2,12 @@ import gc
 import json
 import logging
 import os
+import re
 from functools import reduce
 from pathlib import Path
 from typing import Literal, Sequence
 
+import click
 import joblib
 import numpy as np
 import pandas as pd
@@ -17,23 +19,18 @@ from tqdm.auto import tqdm
 from utils import OUTPUT_BASE, setup_logger
 
 load_dotenv()
-JOBLIB_ROOT = Path(os.getenv("JOBLIB_ROOT")).resolve()
+
+JOBLIB_ROOT_ENV = os.getenv("JOBLIB_ROOT")
+if not JOBLIB_ROOT_ENV:
+    raise RuntimeError("Environment variable 'JOBLIB_ROOT' is not set")
+JOBLIB_ROOT = Path(JOBLIB_ROOT_ENV).resolve(strict=True)
+
+# Pattern: Rad04-zmet0002-M4-0003
+SIM_ATTR_PATTERN = re.compile(r"Rad(\d{2})-zmet(\d{4})-M(\d)-(\d{4})")
 
 logger = logging.getLogger(__name__)
 
 SplitType = Literal["train", "val", "test"]
-
-
-def _load_split_manifest(manifest_path: Path | str) -> dict[str, list[str]]:
-    # load split manifest
-    manifest_path = Path(manifest_path).resolve()
-    if not manifest_path.exists():
-        raise FileNotFoundError(f"Manifest file not found: {manifest_path}")
-    with open(manifest_path, "r") as f:
-        manifest = {
-            k: v for k, v in json.load(f).items() if k in ["train", "val", "test"]
-        }
-    return manifest
 
 
 def _cache_per_run_shard(
@@ -63,28 +60,68 @@ def _cache_per_run_shard(
 
     shard = None
     try:
+        match = SIM_ATTR_PATTERN.match(run_id)
+        if not match:
+            raise ValueError(f"run_id '{run_id}' does not match expected pattern")
+
+        sim_attrs = {
+            "init_gc_radius": int(match.group(1)),
+            "init_metallicity": int(match.group(2)),
+            "init_mass_lv": int(match.group(3)),
+            "init_pos": int(match.group(4)),
+        }
+
         # construct shard file
-        raw_joblib_file = joblib.load(JOBLIB_ROOT / f"{run_id}-obs.joblib")
-        snapshots = [
+        joblib_path = JOBLIB_ROOT / f"{run_id}-obs.joblib"
+        if not joblib_path.exists():
+            raise FileNotFoundError(f"Joblib file not found: {joblib_path}")
+        raw_joblib_file = joblib.load(joblib_path)
+        snapshot_arr = [
             {
                 "feature": pd.DataFrame(snapshot["stars"])
                 .loc[lambda df: df["is_within_2x_r_tidal"]]
                 .reset_index(drop=True)[list(feature_keys)]
                 .to_numpy(),
                 "target": np.asarray([snapshot["header"][key] for key in target_keys]),
+                "meta": np.asarray(
+                    [
+                        snapshot["header"]["time"],
+                        snapshot["header"]["total_mass_within_2x_r_tidal"],
+                        sim_attrs["init_gc_radius"],
+                        sim_attrs["init_metallicity"],
+                        sim_attrs["init_mass_lv"],
+                        sim_attrs["init_pos"],
+                    ]
+                ),
             }
             for coord, series in raw_joblib_file.items()
             for timestamp, snapshot in series.items()
             if (len(pd.DataFrame(snapshot["stars"])) >= min_stars)
             and ("is_within_2x_r_tidal" in pd.DataFrame(snapshot["stars"]).columns)
         ]
+
+        if not snapshot_arr:
+            logger.warning(
+                f"[{split}][{run_id}] No valid snapshots found (min_stars={min_stars})"
+            )
+            return
+
         shard = Shard(
-            feature=np.concatenate([s["feature"] for s in snapshots], axis=0),
+            feature=np.concatenate([s["feature"] for s in snapshot_arr], axis=0),
             feature_keys=feature_keys,
-            target=np.stack([s["target"] for s in snapshots], axis=0),
+            target=np.stack([s["target"] for s in snapshot_arr], axis=0),
             target_keys=target_keys,
+            meta=np.stack([s["meta"] for s in snapshot_arr], axis=0),
+            meta_keys=(
+                "time",
+                "total_mass_within_2x_r_tidal",
+                "init_gc_radius",
+                "init_metallicity",
+                "init_mass_lv",
+                "init_pos",
+            ),
             ptr=np.cumsum(
-                [0] + [s["feature"].shape[0] for s in snapshots], dtype=np.int64
+                [0] + [s["feature"].shape[0] for s in snapshot_arr], dtype=np.int64
             ),
         )
         logger.debug(f"[{split}][{run_id}] writing shard file ...")
@@ -123,6 +160,8 @@ def _merge_per_run_shards(
             (dataset_dir / split / f"{run_id}-shard.npz" for run_id in run_ids),
             key=lambda p: p.name,
         )
+        if missing := [p for p in cached_shard_files if not p.is_file()]:
+            raise FileNotFoundError(f"Missing shard files: {missing}")
     except Exception as e:
         raise RuntimeError(f"[{split}] Failed to fetch cached shard files: {e!r}")
 
@@ -153,19 +192,23 @@ def _merge_per_run_shards(
     finally:
         per_run_dir = Path(dataset_dir) / split
         if per_run_dir.exists() and per_run_dir.is_dir():
+            removed_count = 0
             for child in per_run_dir.iterdir():
                 try:
                     if child.is_file() and (
                         child.name.endswith("-shard.npz")
-                        or child.name.endswith(".npz.tmp")
+                        or child.name.endswith(".tmp.npz")
                     ):
                         child.unlink()
-                except Exception:
-                    logger.debug(f"Failed to remove {child}", exc_info=True)
+                        removed_count += 1
+                except Exception as e:
+                    logger.warning(f"Failed to remove {child}: {e}")
+            logger.debug(f"[{split}] Cleaned up {removed_count} temporary shard files")
             try:
                 per_run_dir.rmdir()
-            except OSError:
-                logger.debug(f"Directory not empty, left {per_run_dir}")
+                logger.debug(f"[{split}] Removed temporary directory: {per_run_dir}")
+            except OSError as e:
+                logger.debug(f"Directory not empty or in use, left {per_run_dir}: {e}")
         del merged_shard
         gc.collect()
 
@@ -210,6 +253,8 @@ def _scale_raw_shard(
             feature_keys=shard.feature_keys,
             target=scaled_target,
             target_keys=shard.target_keys,
+            meta=shard.meta,
+            meta_keys=shard.meta_keys,
             ptr=shard.pointer,
         )
 
@@ -224,6 +269,8 @@ def _scale_raw_shard(
 
 
 def build_dataset(
+    dataset_exp_path: Path | str,
+    split_mft_json: Path | str,
     feature_keys: Sequence[str],
     target_keys: Sequence[str],
     feature_scaler_config: dict[tuple[str, ...], NormMethod],
@@ -239,28 +286,47 @@ def build_dataset(
         )
     )
 
-    dataset_dir = OUTPUT_BASE / "dataset"
-    dataset_dir.mkdir(parents=True, exist_ok=True)
+    dataset_exp_path = (
+        (OUTPUT_BASE / dataset_exp_path)
+        if dataset_exp_path is not None
+        else (OUTPUT_BASE / "dataset")
+    ).resolve()
+    dataset_exp_path.mkdir(parents=True, exist_ok=True)
 
-    manifest = _load_split_manifest(manifest_path := Path(os.getenv("SPLIT_MFT_JSON")))
+    with open(split_mft_json, "r") as f:
+        manifest = {
+            k: v for k, v in json.load(f).items() if k in ["train", "val", "test"]
+        }
+
+    # validate manifest completeness
+    required_splits = {"train", "val", "test"}
+    missing_splits = required_splits - set(manifest.keys())
+    if missing_splits:
+        raise ValueError(f"Manifest missing required splits: {missing_splits}")
+
+    # validate that each split has data
+    if empty_splits := [k for k, v in manifest.items() if not v]:
+        raise ValueError(f"Manifest has empty splits: {empty_splits}")
+
     logger.info(
-        f"Loaded split manifest from {manifest_path}: { {k: len(v) for k, v in manifest.items()} }"
+        f"Loaded split manifest from {split_mft_json}: { {k: len(v) for k, v in manifest.items()} }"
     )
 
     if splits := [
         split
         for split in ["train", "val", "test"]
-        if not (dataset_dir / f"raw-{split}-shard.npz").is_file()
+        if not (dataset_exp_path / f"raw-{split}-shard.npz").is_file()
     ]:
         logger.info(f"Starting to collect shards for splits: {splits}")
         Parallel(n_jobs=30)(
             delayed(_cache_per_run_shard)(
                 run_id=run_id,
                 split=split,
-                dataset_dir=dataset_dir,
+                dataset_dir=dataset_exp_path,
                 feature_keys=feature_keys,
                 target_keys=target_keys,
                 min_stars=10,
+                log_file=log_file,
             )
             for split in tqdm(
                 splits,
@@ -284,26 +350,61 @@ def build_dataset(
     Parallel(n_jobs=3)(
         delayed(_merge_per_run_shards)(
             split=split,
-            dataset_dir=dataset_dir,
+            dataset_dir=dataset_exp_path,
             run_ids=manifest[split],
+            log_file=log_file,
         )
         for split in ["train", "val", "test"]
     )
     logger.info("Split shards merged, continue to scaling...")
+
+    # validate that all merged shards exist
+    for split in ["train", "val", "test"]:
+        merged_path = dataset_exp_path / f"raw-{split}-shard.npz"
+        if not merged_path.exists():
+            raise FileNotFoundError(f"Expected merged shard not found: {merged_path}")
+
+    logger.info("All merged shards validated.")
 
     # initialize scaler bundles from config
     feature_scaler_bundle = ArrayScalerBundle(feature_scaler_config)
     target_scaler_bundle = ArrayScalerBundle(target_scaler_config)
 
     # fit scalers using the TRAIN shard
-    train_shard = Shard.from_npz(dataset_dir / "raw-train-shard.npz")
+    train_shard_path = dataset_exp_path / "raw-train-shard.npz"
+    if not train_shard_path.exists():
+        raise FileNotFoundError(f"Train shard not found: {train_shard_path}")
+
+    train_shard = Shard.from_npz(train_shard_path)
+    if len(train_shard) == 0:
+        raise ValueError("Train shard is empty, cannot fit scalers")
+
     feature_scaler_bundle.fit(train_shard.feature, train_shard.feature_keys)
     target_scaler_bundle.fit(train_shard.target, train_shard.target_keys)
     del train_shard
     gc.collect()
-    feature_scaler_bundle.to_joblib(dataset_dir / "feature_scaler_bundle.joblib")
-    target_scaler_bundle.to_joblib(dataset_dir / "target_scaler_bundle.joblib")
+    feature_scaler_bundle.to_joblib(dataset_exp_path / "feature_scaler_bundle.joblib")
+    target_scaler_bundle.to_joblib(dataset_exp_path / "target_scaler_bundle.joblib")
     logger.info("Scalers fitted and saved.")
+
+    try:
+        dataset_config = {
+            "manifest": manifest,
+            "feature_keys": list(feature_keys),
+            "target_keys": list(target_keys),
+            "feature_scaler_config": feature_scaler_bundle.to_dict(),
+            "target_scaler_config": target_scaler_bundle.to_dict(),
+            "feature_scaler_joblib": "feature_scaler_bundle.joblib",
+            "target_scaler_joblib": "target_scaler_bundle.joblib",
+        }
+        cfg_exp_path = dataset_exp_path / "dataset_config.json"
+        with open(cfg_exp_path, "w") as ef:
+            json.dump(dataset_config, ef, indent=2)
+        logger.info(
+            f"Exported combined split manifest and scaler config to {cfg_exp_path}"
+        )
+    except Exception as e:
+        logger.exception(f"Failed to export combined JSON: {e!r}")
 
     for split in tqdm(
         ["train", "val", "test"],
@@ -316,14 +417,32 @@ def build_dataset(
             feature_scaler_bundle=feature_scaler_bundle,
             target_scaler_bundle=target_scaler_bundle,
             split=split,
-            dataset_dir=dataset_dir,
+            dataset_dir=dataset_exp_path,
+            log_file=log_file,
         )
 
     logger.info("Dataset building completed.")
 
 
-if __name__ == "__main__":
+@click.command()
+@click.option(
+    "--dataset-export-path",
+    "dataset_export_path",
+    type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
+    default=None,
+    help="Path to save the dataset. If omitted uses OUTPUT_BASE/dataset.",
+)
+@click.option(
+    "--split-mft-json",
+    "split_mft_json",
+    type=click.Path(exists=True, file_okay=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="Path to JSON file containing train/val/test split metadata (run IDs).",
+)
+def main(dataset_export_path: Path, split_mft_json: Path) -> None:
     build_dataset(
+        dataset_exp_path=dataset_export_path,
+        split_mft_json=split_mft_json,
         feature_keys=(
             "x",
             "y",
@@ -353,3 +472,7 @@ if __name__ == "__main__":
             ("total_mass_within_2x_r_tidal",): "log10_standard",
         },
     )
+
+
+if __name__ == "__main__":
+    main()
