@@ -243,7 +243,15 @@ class TestParquetWriter(pl.Callback):
         batch_idx: int,
         dataloader_idx: int = 0,
     ) -> None:
-        predictions_scaled, targets_scaled, meta, snapshot_ids, sample_ids, source_counts, sample_counts = outputs
+        (
+            predictions_scaled,
+            targets_scaled,
+            meta,
+            snapshot_ids,
+            sample_ids,
+            source_counts,
+            sample_counts,
+        ) = outputs
 
         data_module = trainer.datamodule
 
@@ -491,9 +499,17 @@ class TestParquetWriter(pl.Callback):
     show_default=True,
     help="Early stopping patience when no improvement in validation loss.",
 )
+@click.option(
+    "--subfolder",
+    type=str,
+    default="",
+    help="Subfolder within experiment output directory.",
+    show_default=True,
+)
 def train(
     seed: int,
     dataset_dir: Path,
+    subfolder: str,
     model: str,
     feature_keys: tuple[str, ...],
     target_key: str,
@@ -555,7 +571,11 @@ def train(
     )
     logger.info(f"Model Version: {version_str}")
 
-    output_dir = OUTPUT_BASE / "experiments" / version_str
+    output_dir = (
+        (OUTPUT_BASE / "experiments" / subfolder / version_str)
+        if subfolder
+        else (OUTPUT_BASE / "experiments" / version_str)
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     num_devices = torch.cuda.device_count() if torch.cuda.is_available() else 1
