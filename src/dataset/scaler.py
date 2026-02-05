@@ -59,11 +59,19 @@ def _identity_inv(x):
 
 
 def _log10_transform(x):
-    return np.log10(x + EPS)
+    return np.log10(np.clip(x, EPS, None) + EPS)
 
 
 def _log10_inverse(x):
     return np.clip(np.power(10.0, x) - EPS, 0, None)
+
+
+def _log1p_transform(x):
+    return np.log1p(np.clip(x, 0, None))
+
+
+def _log1p_inverse(x):
+    return np.clip(np.expm1(x), 0, None)
 
 
 def _asinh_transform(x):
@@ -90,7 +98,7 @@ class ArrayScaler:
 
         # assign scaler
         identity = FunctionTransformer(
-            func=_identity_fn, inverse_func=_identity_inv, validate=True
+            func=_identity_fn, inverse_func=_identity_inv, check_inverse=True
         )
         match method:
             case "identity":
@@ -109,8 +117,12 @@ class ArrayScaler:
                 )
             case _ if method.startswith("log"):
                 is_log1p = "log1p" in method
-                log_fn = np.log1p if is_log1p else _log10_transform
-                inv_fn = np.expm1 if is_log1p else _log10_inverse
+                if is_log1p:
+                    log_fn = _log1p_transform
+                    inv_fn = _log1p_inverse
+                else:
+                    log_fn = _log10_transform
+                    inv_fn = _log10_inverse
                 scaler = StandardScaler() if "standard" in method else MinMaxScaler()
 
                 return method, Pipeline(

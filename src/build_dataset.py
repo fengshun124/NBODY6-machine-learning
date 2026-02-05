@@ -596,15 +596,15 @@ def main(dataset_export_path: Path, split_mft_json: Path) -> None:
             "total_mass_within_2x_r_tidal",
         ),
         feature_scaler_config={
-            ("x", "y", "z"): "robust",
-            ("vx", "vy", "vz"): "robust",
-            ("lon_deg", "lat_deg"): "robust",
-            ("pm_lon_coslat_mas_yr", "pm_lat_mas_yr"): "robust",
+            ("x", "y", "z"): "asinh_standard",
+            ("vx", "vy", "vz"): "asinh_standard",
+            ("lon_deg", "lat_deg"): "asinh_standard",
+            ("pm_lon_coslat_mas_yr", "pm_lat_mas_yr"): "asinh_standard",
             ("log_L_L_sol",): "robust",
         },
         target_scaler_config={
-            ("time",): "robust",
-            ("total_mass_within_2x_r_tidal",): "log10_standard",
+            ("time",): "asinh_standard",
+            ("total_mass_within_2x_r_tidal",): "asinh_standard",
         },
     )
 
