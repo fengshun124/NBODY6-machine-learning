@@ -9,6 +9,17 @@ from dataset.scaler import ArrayScalerBundle
 from dataset.shard import Shard
 from torch.utils.data import DataLoader, Dataset
 
+DataSample = tuple[
+    torch.Tensor,  # features
+    torch.Tensor,  # targets
+    torch.Tensor,  # valid masks
+    torch.Tensor,  # metas (snapshot-level data)
+    torch.Tensor,  # snapshot indices
+    torch.Tensor,  # sample indices
+    torch.Tensor,  # source counts
+    torch.Tensor,  # sample counts
+]
+
 
 def _worker_init_fn(worker_id: int) -> None:
     worker_info = torch.utils.data.get_worker_info()
@@ -100,7 +111,7 @@ class NBODY6SnapshotDataset(Dataset):
 
     def __getitem__(
         self, index: int
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, int, int, int]:
         sample_idx = int(index % self._num_sample_per_snapshot)
         snapshot_idx = int(index // self._num_sample_per_snapshot)
 
@@ -116,8 +127,8 @@ class NBODY6SnapshotDataset(Dataset):
             )
         )
 
-        # get data from shard
-        full_features, full_targets = self._shard[snapshot_idx]
+        # get data from shard (features, targets, meta)
+        full_features, full_targets, meta = self._shard[snapshot_idx]
         features = full_features[:, self._feature_col_indices]
         target = full_targets[self._target_col_idx]
 
@@ -130,12 +141,13 @@ class NBODY6SnapshotDataset(Dataset):
         valid_mask = np.zeros(self._num_star_per_sample, dtype=bool)
 
         if n_stars >= self._num_star_per_sample:
-            # enough stars: sample without replacement
+            # enough stars: sample without replacement and shuffle
             chosen = rng.choice(
                 n_stars,
                 size=self._num_star_per_sample,
                 replace=False,
             )
+            rng.shuffle(chosen)
             sampled_features[:] = features[chosen]
             valid_mask[:] = True
 
@@ -154,16 +166,23 @@ class NBODY6SnapshotDataset(Dataset):
                     sampled_features[drop_indices] = 0
                     valid_mask[drop_indices] = False
         else:
-            # insufficient stars: use all available + padding
-            sampled_features[:n_stars] = features
+            # insufficient stars: shuffle all available stars + padding
+            shuffled_indices = rng.permutation(n_stars)
+            sampled_features[:n_stars] = features[shuffled_indices]
             valid_mask[:n_stars] = True
+
+        # count actual valid entries
+        n_valid = int(valid_mask.sum())
 
         return (
             sampled_features,
             np.array([target], dtype=np.float32),
             valid_mask,
+            meta,
             snapshot_idx,
             sample_idx,
+            n_stars,
+            n_valid,
         )
 
     @property
@@ -307,15 +326,29 @@ class NBODY6DataModule(pl.LightningDataModule):
 
     @staticmethod
     def _collate_fn(
-        batch: list[tuple[np.ndarray, np.ndarray, np.ndarray, int, int]],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        features, targets, masks, snapshot_indices, sample_indices = zip(*batch)
+        batch: list[
+            tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, int, int, int]
+        ],
+    ) -> DataSample:
+        (
+            features,
+            targets,
+            masks,
+            metas,
+            snapshot_indices,
+            sample_indices,
+            source_counts,
+            sample_counts,
+        ) = zip(*batch)
         return (
             torch.from_numpy(np.stack(features, axis=0)),
             torch.from_numpy(np.stack(targets, axis=0)),
             torch.from_numpy(np.stack(masks, axis=0)),
+            torch.from_numpy(np.stack(metas, axis=0)),
             torch.from_numpy(np.array(snapshot_indices, dtype=np.int64)),
             torch.from_numpy(np.array(sample_indices, dtype=np.int64)),
+            torch.from_numpy(np.array(source_counts, dtype=np.int64)),
+            torch.from_numpy(np.array(sample_counts, dtype=np.int64)),
         )
 
     def _make_dataloader(self, dataset: Dataset, shuffle: bool) -> DataLoader:

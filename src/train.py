@@ -11,7 +11,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytorch_lightning as pl
 import torch
-from dataset.module import NBODY6DataModule
+from dataset.module import DataSample, NBODY6DataModule
 from model import DeepSetRegressor, SetTransformerRegressor, SummaryStatsRegressor
 from orchestrator import LightningRegressionOrchestrator
 from pytorch_lightning.callbacks import (
@@ -238,16 +238,16 @@ class TestParquetWriter(pl.Callback):
         self,
         trainer: pl.Trainer,
         pl_module: pl.LightningModule,
-        outputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-        batch: tuple[
-            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-        ],
+        outputs: DataSample,
+        batch: DataSample,
         batch_idx: int,
         dataloader_idx: int = 0,
     ) -> None:
-        predictions_scaled, targets_scaled, snapshot_ids, sample_ids = outputs
+        predictions_scaled, targets_scaled, meta, snapshot_ids, sample_ids, source_counts, sample_counts = outputs
 
         data_module = trainer.datamodule
+
+        meta_np = meta.detach().cpu().numpy()
 
         table = pa.table(
             {
@@ -259,11 +259,13 @@ class TestParquetWriter(pl.Callback):
                     .astype(np.int64)
                 ),
                 "sample_id": (
-                    sample_ids_np := sample_ids.detach()
-                    .cpu()
-                    .numpy()
-                    .reshape(-1)
-                    .astype(np.int64)
+                    sample_ids.detach().cpu().numpy().reshape(-1).astype(np.int64)
+                ),
+                "source_count": (
+                    source_counts.detach().cpu().numpy().reshape(-1).astype(np.int64)
+                ),
+                "sample_count": (
+                    sample_counts.detach().cpu().numpy().reshape(-1).astype(np.int64)
                 ),
                 "prediction_scaled": (
                     predictions_scaled_np := predictions_scaled.detach()
@@ -283,6 +285,13 @@ class TestParquetWriter(pl.Callback):
                 "target_original": data_module.inverse_transform_targets(
                     targets_scaled_np.reshape(-1, 1)
                 ).reshape(-1),
+                # meta columns
+                "time": meta_np[:, 0],
+                "total_mass_within_2x_r_tidal": meta_np[:, 1],
+                "init_gc_radius": meta_np[:, 2].astype(np.int32),
+                "init_metallicity": meta_np[:, 3].astype(np.int32),
+                "init_mass_lv": meta_np[:, 4].astype(np.int32),
+                "init_pos": meta_np[:, 5].astype(np.int32),
             }
         )
 
@@ -291,7 +300,7 @@ class TestParquetWriter(pl.Callback):
         self._part_writer.write_table(table)
 
         logger.debug(
-            f"[Test batch {batch_idx}] Wrote {len(snapshot_ids_np)} snapshots totaling {len(sample_ids_np)} samples to {self._output_file_part}"
+            f"[Test batch {batch_idx}] Wrote {len(snapshot_ids_np)} samples with metadata to {self._output_file_part}"
         )
 
     def on_test_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
@@ -408,11 +417,13 @@ class TestParquetWriter(pl.Callback):
     type=click.Tuple([click.FloatRange(0.0, 1.0), click.FloatRange(0.0, 1.0)]),
     default=(0.1, 0.9),
     show_default=True,
-    callback=lambda ctx, param, value: value
-    if value[0] <= value[1]
-    else (_ for _ in ()).throw(
-        click.BadParameter(
-            f"Expected lower bound <= upper bound for drop ratio range, got {value}"
+    callback=lambda ctx, param, value: (
+        value
+        if value[0] <= value[1]
+        else (_ for _ in ()).throw(
+            click.BadParameter(
+                f"Expected lower bound <= upper bound for drop ratio range, got {value}"
+            )
         )
     ),
     help="Range of ratio of stars to drop when applying random star dropping.",

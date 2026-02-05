@@ -2,6 +2,7 @@ from typing import Any, Type
 
 import pytorch_lightning as pl
 import torch
+from dataset.module import DataSample
 from torch import nn
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
@@ -55,12 +56,19 @@ class LightningRegressionOrchestrator(pl.LightningModule):
 
     def _evaluation(
         self,
-        batch: tuple[
-            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-        ],
+        batch: DataSample,
         stage: str,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        inputs, targets, mask, snapshot_ids, sample_ids = batch
+    ) -> DataSample:
+        (
+            inputs,
+            targets,
+            mask,
+            meta,
+            snapshot_ids,
+            sample_ids,
+            source_counts,
+            sample_counts,
+        ) = batch
         mask = mask.bool()
 
         predictions = self(inputs, mask).view(-1)
@@ -89,22 +97,44 @@ class LightningRegressionOrchestrator(pl.LightningModule):
                 sync_dist=True,
             )
 
-        return loss, predictions, targets, snapshot_ids, sample_ids
+        return (
+            loss,
+            predictions,
+            targets,
+            meta,
+            snapshot_ids,
+            sample_ids,
+            source_counts,
+            sample_counts,
+        )
 
     def training_step(self, batch, batch_idx) -> torch.Tensor:
-        loss, _, _, _, _ = self._evaluation(batch=batch, stage="train")
+        loss, _, _, _, _, _, _, _ = self._evaluation(batch=batch, stage="train")
         return loss
 
     def validation_step(self, batch, batch_idx) -> None:
         self._evaluation(batch=batch, stage="val")
 
-    def test_step(
-        self, batch, batch_idx
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        _, predictions, targets, snapshot_ids, sample_ids = self._evaluation(
-            batch=batch, stage="test"
+    def test_step(self, batch, batch_idx) -> DataSample:
+        (
+            _,
+            predictions,
+            targets,
+            meta,
+            snapshot_ids,
+            sample_ids,
+            source_counts,
+            sample_counts,
+        ) = self._evaluation(batch=batch, stage="test")
+        return (
+            predictions,
+            targets,
+            meta,
+            snapshot_ids,
+            sample_ids,
+            source_counts,
+            sample_counts,
         )
-        return predictions, targets, snapshot_ids, sample_ids
 
     def configure_optimizers(self) -> dict[str, Any]:
         optimizer = torch.optim.AdamW(
@@ -160,6 +190,8 @@ class ToySetDataset(Dataset):
             valid_elements = self.data[i, : self.set_sizes[i], 0]
             self.targets[i] = valid_elements.mean() * 10.0 + 5.0
 
+        self.metadata = torch.randn(num_samples, 6)
+
         # store normalization parameters or compute from this dataset
         if y_mean is not None and y_std is not None:
             self.y_mean = y_mean
@@ -177,15 +209,18 @@ class ToySetDataset(Dataset):
     def __len__(self) -> int:
         return self.num_samples
 
-    def __getitem__(
-        self, idx: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> DataSample:
+        set_size = int(self.set_sizes[idx].item())
+        valid_count = int(self.masks[idx].sum().item())
         return (
             self.data[idx],
             self.norm_targets[idx],
             self.masks[idx],
+            self.metadata[idx],
             torch.tensor(idx, dtype=torch.int64),
             torch.tensor(0, dtype=torch.int64),
+            torch.tensor(set_size, dtype=torch.int64),
+            torch.tensor(valid_count, dtype=torch.int64),
         )
 
 
@@ -349,7 +384,7 @@ if __name__ == "__main__":
     toy_data_module.setup()
     test_loader = toy_data_module.test_dataloader()
     dummy_batch = next(iter(test_loader))
-    x, y_norm, mask, snapshot_ids, sample_ids = dummy_batch
+    x, y_norm, mask, meta, snapshot_ids, sample_ids = dummy_batch
 
     orchestrator.eval()
     with torch.no_grad():
