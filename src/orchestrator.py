@@ -4,7 +4,7 @@ import pytorch_lightning as pl
 import torch
 from dataset.module import DataSample
 from torch import nn
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Dataset
 from torchmetrics import MeanAbsoluteError, MeanSquaredError
 
@@ -15,8 +15,9 @@ class LightningRegressionOrchestrator(pl.LightningModule):
         regressor: nn.Module | Type[nn.Module],
         hyperparameters: dict[str, Any],
         huber_delta: float = 1.0,
-        learning_rate: float = 3e-3,
-        weight_decay: float = 1e-4,
+        learning_rate: float = 3e-4,
+        weight_decay: float = 1e-3,
+        warmup_epochs: int = 5,
         lr_scheduler_t_max: int = 50,
         seed: int = 42,
     ) -> None:
@@ -28,6 +29,7 @@ class LightningRegressionOrchestrator(pl.LightningModule):
                 "weight_decay": weight_decay,
                 "model_hparams": hyperparameters,
                 "loss_huber_delta": huber_delta,
+                "warmup_epochs": warmup_epochs,
                 "lr_scheduler_t_max": lr_scheduler_t_max,
                 "seed": seed,
             }
@@ -143,10 +145,22 @@ class LightningRegressionOrchestrator(pl.LightningModule):
             weight_decay=self.hparams.weight_decay,
         )
 
-        scheduler = CosineAnnealingLR(
+        scheduler = SequentialLR(
             optimizer=optimizer,
-            T_max=self.hparams.lr_scheduler_t_max,
-            eta_min=self.hparams.learning_rate * 1e-3,
+            schedulers=[
+                LinearLR(
+                    optimizer=optimizer,
+                    start_factor=1e-3,
+                    end_factor=1.0,
+                    total_iters=self.hparams.warmup_epochs,
+                ),
+                CosineAnnealingLR(
+                    optimizer=optimizer,
+                    T_max=self.hparams.lr_scheduler_t_max,
+                    eta_min=self.hparams.learning_rate * 1e-3,
+                ),
+            ],
+            milestones=[self.hparams.warmup_epochs],
         )
 
         return {
@@ -345,7 +359,7 @@ if __name__ == "__main__":
             "num_sabs": 2,
             "output_hidden_dims": (8,),
         },
-        learning_rate=3e-3,
+        learning_rate=3e-4,
         seed=SEED,
     )
 

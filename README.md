@@ -18,14 +18,28 @@ Python 3.12+ with the following packages (see [`requirements.txt`](./requirement
 - `tqdm`
 - `pyarrow`
 
-Optionally, for GPU monitoring during training, install [nvitop](https://github.com/XuehaiPan/nvitop):
+Optionally, for GPU monitoring during training, activate your environment first (conda/mamba/venv), then install one of [nvitop](https://github.com/XuehaiPan/nvitop) or [gpustat](https://github.com/wookayin/gpustat):
 
 ```bash
-# using conda (conda-forge)
-conda install -c conda-forge nvitop
+# using conda (conda-forge) - pick one
+conda install conda-forge::nvitop
+conda install conda-forge::gpustat
 
-# or using pip
+# or using pip - pick one
 pip install nvitop
+pip install gpustat
+```
+
+To monitor the GPU status, try:
+
+```bash
+# nvitop
+nvitop
+```
+
+```bash
+# gpustat (macOS/Linux)
+watch -n 1 -c gpustat --color
 ```
 
 ## Usage
@@ -47,19 +61,22 @@ cp .env.template .env
 Build the cached, scaled dataset from NBODY6 pipeline joblib caches. Run this from the `machine-learning` directory:
 
 ```bash
-python ./src/build_dataset.py --split-mft-json /path/to/split/manifest.json
+python ./src/build_dataset.py \
+  --split-mft-json /path/to/split/manifest.json \
+  --dataset-export-path dataset  # optional (default: OUTPUT_BASE/dataset)
 ```
 
-Outputs produced under `OUTPUT_BASE/dataset/`:
+Outputs produced under the dataset export path (default `OUTPUT_BASE/dataset/`):
 
 - `raw-<split>-shard.npz` — merged per-split raw shards (train/val/test)
 - `scaled-<split>-shard.npz` — scaled shards used for training and evaluation
 - `feature_scaler_bundle.joblib`, `target_scaler_bundle.joblib` — fitted scalers
+- `dataset_config.json` — manifest, feature/target keys, scaler config, and checksums
 
 Notes:
 
 - The script expects a split manifest passed via `--split-mft-json` (see [NBODY6-data-pipeline/notebooks/dataset_split.ipynb](https://github.com/fengshun124/NBODY6-data-pipeline/blob/main/notebooks/dataset_split.ipynb) for manifest generation) and loads joblib caches from the directory specified by `JOBLIB_ROOT` in `.env` file (see [NBODY6-data-pipeline/README.md](https://github.com/fengshun124/NBODY6-data-pipeline/blob/main/README.md) for details).
-- If you customize feature/target keys or scaler configuration, update the call or the env vars accordingly.
+- The default feature/target keys and scaler config are defined in `src/build_dataset.py` (`main`). Update there if you need different fields.
 
 ### Train a model
 
@@ -68,7 +85,7 @@ After building the dataset, invoke the training entrypoint from `machine-learnin
 ```bash
 # Example: use one GPU
 CUDA_VISIBLE_DEVICES=0 python ./src/train.py \
-  --dataset /path/to/cached/dataset/ \
+  --dataset /path/to/dataset/ \
   --feature-keys x \
   --feature-keys y \
   --feature-keys z \
@@ -96,9 +113,9 @@ python ./src/train.py --help
 
 - Dataset and feature/target specification:
 
-  - `--dataset`: path to the `dataset` folder created by `build_dataset.py`.
+  - `--dataset`: path to the dataset export folder created by `build_dataset.py` (contains `scaled-*-shard.npz` and `dataset_config.json`).
   - `--feature-keys`: repeatable; per-element input features (e.g., `x`, `y`, `z`, `vx`, `vy`, `vz`).
-  - `--target-key`: regression target to predict.
+  - `--target-key`: regression target to predict (must be one of the dataset target keys, e.g., `time` or `total_mass_within_2x_r_tidal`).
   - `--num-star-per-sample`: number of stars per input set sample.
   - `--num-sample-per-snapshot`: number of set samples drawn from each snapshot during training/validation/testing.
   - `--drop-probability`: probability of dropping stars from samples when a snapshot contains more than `--num-star-per-sample` stars (default `0.6`).
@@ -110,14 +127,22 @@ python ./src/train.py --help
   - `--hparam KEY=VALUE`: model hyperparameters (repeatable). Values accept Python literals (numbers, tuples, booleans).
   - `--huber-delta`: delta parameter used by the Huber loss during training (default `1.0`).
 
+  **Default model hyperparameters**
+
+  - **set_transformer**: `hidden_dim=6`, `num_heads=2`, `num_sabs=1`, `output_hidden_dims=None`, `dropout=0.1`, `is_apply_layer_norm=True`.
+  - **deep_sets**: `phi_hidden_dims=(8, 4)`, `rho_hidden_dims=(8, 4)`, `dropout=0.1`, `pooling='mean'`.
+  - **summary_stats**: `hidden_dims=(8, 4)`, `dropout=0.1`.
+
 - Training configuration:
 
   - `--seed`: random seed for reproducibility.
   - `-lr` / `-wd` / `-bs`: shorthand for `--learning-rate`, `--weight-decay`, `--batch-size`, respectively.
   - `--num-workers`: number of DataLoader workers.
   - `--pin-memory/--no-pin-memory`: toggle `pin_memory` for the DataLoader (default `--pin-memory`).
-  - `--max-epochs`: maximum number of training epochs.
+  - `--max-epochs`: maximum number of training epochs (default `50`)
+  - `--warmup-epochs`: warmup epochs not counted in max epochs (default `5`).
   - `--patience`: early stopping patience in epochs.
+  - `--subfolder`: optional subfolder under `OUTPUT_BASE/experiments/` for organizing runs.
 
 See [`src/train.py`](./src/train.py) for full details on all options.
 

@@ -97,10 +97,11 @@ def _build_model(
     drop_probability: float = 0.4,
     drop_ratio_range: tuple[float, float] = (0.1, 0.9),
     batch_size: int = 5120,
-    learning_rate: float = 3e-3,
-    weight_decay: float = 1e-4,
+    learning_rate: float = 3e-4,
+    weight_decay: float = 1e-3,
     huber_delta: float = 1.0,
     max_epochs: int = 50,
+    warmup_epochs: int = 5,
     seed: int = 42,
 ) -> tuple[pl.LightningModule, str]:
     model_name = model_name.lower()
@@ -170,6 +171,7 @@ def _build_model(
         huber_delta=huber_delta,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
+        warmup_epochs=warmup_epochs,
         lr_scheduler_t_max=max_epochs,
         seed=seed,
     )
@@ -463,7 +465,7 @@ class TestParquetWriter(pl.Callback):
     "--learning-rate",
     "learning_rate",
     type=float,
-    default=3e-3,
+    default=3e-4,
     show_default=True,
     help="Learning rate.",
 )
@@ -472,7 +474,7 @@ class TestParquetWriter(pl.Callback):
     "--weight-decay",
     "weight_decay",
     type=float,
-    default=1e-4,
+    default=1e-3,
     show_default=True,
     help="Weight decay.",
 )
@@ -491,6 +493,14 @@ class TestParquetWriter(pl.Callback):
     default=50,
     show_default=True,
     help="Maximum number of training epochs.",
+)
+@click.option(
+    "--warmup-epochs",
+    "warmup_epochs",
+    type=click.IntRange(min=0),
+    default=5,
+    show_default=True,
+    help="Warmup epochs not counted in max_epochs.",
 )
 @click.option(
     "--patience",
@@ -525,6 +535,7 @@ def train(
     weight_decay: float,
     huber_delta: float,
     max_epochs: int,
+    warmup_epochs: int,
     patience: int,
 ) -> None:
     setup_logger(OUTPUT_BASE / "log" / "train.log")
@@ -566,7 +577,8 @@ def train(
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         huber_delta=huber_delta,
-        max_epochs=max_epochs,
+        max_epochs=max_epochs + warmup_epochs,
+        warmup_epochs=warmup_epochs,
         seed=seed,
     )
     logger.info(f"Model Version: {version_str}")
