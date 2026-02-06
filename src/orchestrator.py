@@ -172,6 +172,13 @@ class LightningRegressionOrchestrator(pl.LightningModule):
             },
         }
 
+    # passing epoch to scheduler.step()
+    def lr_scheduler_step(self, scheduler, metric) -> None:
+        if metric is None:
+            scheduler.step()
+        else:
+            scheduler.step(metric)
+
 
 # FOR TESTING PURPOSES ONLY!!!
 class ToySetDataset(Dataset):

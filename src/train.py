@@ -24,7 +24,11 @@ from utils import OUTPUT_BASE, setup_logger
 
 logger = logging.getLogger(__name__)
 
-torch.set_float32_matmul_precision("medium")
+# balance between numerical stability and performance for matmul and convolutions
+torch.set_float32_matmul_precision("high")
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
 
 # models and their default hyperparameters
@@ -57,6 +61,14 @@ MODEL_REGISTRY: dict[str, dict[str, object]] = {
         },
     },
 }
+
+
+def _select_precision() -> str:
+    if not torch.cuda.is_available():
+        return "32-true"
+    if torch.cuda.is_bf16_supported():
+        return "bf16-mixed"
+    return "16-mixed"
 
 
 def _fmt_value(v: object) -> str:
@@ -606,6 +618,7 @@ def train(
         max_epochs=max_epochs,
         gradient_clip_val=0.5,
         log_every_n_steps=100,
+        precision=_select_precision(),
         deterministic=True,
         logger=CSVLogger(
             name="",
