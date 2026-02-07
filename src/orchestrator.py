@@ -1,10 +1,12 @@
+import math
 from typing import Any, Type
 
+import click
 import pytorch_lightning as pl
 import torch
 from dataset.module import DataSample
 from torch import nn
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset
 from torchmetrics import MeanAbsoluteError, MeanSquaredError
 
@@ -15,7 +17,7 @@ class LightningRegressionOrchestrator(pl.LightningModule):
         regressor: nn.Module | Type[nn.Module],
         hyperparameters: dict[str, Any],
         huber_delta: float = 1.0,
-        learning_rate: float = 3e-4,
+        learning_rate: float = 1e-4,
         weight_decay: float = 1e-3,
         warmup_epochs: int = 5,
         lr_scheduler_t_max: int = 50,
@@ -145,23 +147,32 @@ class LightningRegressionOrchestrator(pl.LightningModule):
             weight_decay=self.hparams.weight_decay,
         )
 
-        scheduler = SequentialLR(
-            optimizer=optimizer,
-            schedulers=[
-                LinearLR(
-                    optimizer=optimizer,
-                    start_factor=1e-3,
-                    end_factor=1.0,
-                    total_iters=self.hparams.warmup_epochs,
-                ),
-                CosineAnnealingLR(
-                    optimizer=optimizer,
-                    T_max=self.hparams.lr_scheduler_t_max,
-                    eta_min=self.hparams.learning_rate * 1e-3,
-                ),
-            ],
-            milestones=[self.hparams.warmup_epochs],
-        )
+        warmup_epochs = int(self.hparams.warmup_epochs)
+        cosine_t_max = int(self.hparams.lr_scheduler_t_max)
+        if warmup_epochs < 0:
+            raise ValueError(
+                f"'warmup_epochs' must be >= 0, got {self.hparams.warmup_epochs!r}"
+            )
+        if cosine_t_max <= 0:
+            raise ValueError(
+                f"'lr_scheduler_t_max' must be > 0, got {self.hparams.lr_scheduler_t_max!r}"
+            )
+        start_factor = 1e-3
+        eta_min_factor = 1e-3
+
+        def _warmup_cosine_lr_lambda(epoch: int) -> float:
+            if warmup_epochs > 0 and epoch < warmup_epochs:
+                progress = epoch / warmup_epochs
+                return start_factor + (1.0 - start_factor) * progress
+
+            cosine_epoch = max(0, min(epoch - warmup_epochs, cosine_t_max))
+            cosine_term = 0.5 * (
+                1.0 + math.cos(math.pi * cosine_epoch / cosine_t_max)
+            )
+            return eta_min_factor + (1.0 - eta_min_factor) * cosine_term
+
+
+        scheduler = LambdaLR(optimizer=optimizer, lr_lambda=_warmup_cosine_lr_lambda)
 
         return {
             "optimizer": optimizer,
@@ -171,13 +182,6 @@ class LightningRegressionOrchestrator(pl.LightningModule):
                 "frequency": 1,
             },
         }
-
-    # passing epoch to scheduler.step()
-    def lr_scheduler_step(self, scheduler, metric) -> None:
-        if metric is None:
-            scheduler.step()
-        else:
-            scheduler.step(metric)
 
 
 # FOR TESTING PURPOSES ONLY!!!
@@ -334,8 +338,14 @@ class ToySetDataModule(pl.LightningDataModule):
     def denormalize(self, y_norm: torch.Tensor) -> torch.Tensor:
         return y_norm * self.y_std + self.y_mean
 
-
-if __name__ == "__main__":
+@click.command(
+    help="Run a toy sanity-check training to verify the orchestrator wiring."
+)
+def _test_run():
+    print(
+        "Hint: this run uses a toy dataset for a quick orchestrator sanity check, "
+        "not full training."
+    )
     from pytorch_lightning.loggers import CSVLogger
 
     try:
@@ -366,7 +376,7 @@ if __name__ == "__main__":
             "num_sabs": 2,
             "output_hidden_dims": (8,),
         },
-        learning_rate=3e-4,
+        learning_rate=1e-4,
         seed=SEED,
     )
 
@@ -405,7 +415,16 @@ if __name__ == "__main__":
     toy_data_module.setup()
     test_loader = toy_data_module.test_dataloader()
     dummy_batch = next(iter(test_loader))
-    x, y_norm, mask, meta, snapshot_ids, sample_ids = dummy_batch
+    (
+        x,
+        y_norm,
+        mask,
+        meta,
+        snapshot_ids,
+        sample_ids,
+        source_counts,
+        sample_counts,
+    ) = dummy_batch
 
     orchestrator.eval()
     with torch.no_grad():
@@ -427,3 +446,6 @@ if __name__ == "__main__":
     print("-" * 60)
     print(f"Mean Absolute Error: {mae:.4f}")
     print(" END OF TEST ".center(60, "="))
+
+if __name__ == "__main__":
+    _test_run()

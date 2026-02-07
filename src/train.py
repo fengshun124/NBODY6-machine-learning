@@ -76,6 +76,8 @@ def _fmt_value(v: object) -> str:
     s = str(v)
     if isinstance(v, (list, tuple)):
         s = "x".join(map(str, v))
+    if "/" in s:
+        raise ValueError(f"Unsupported '/' in version value: {s!r}")
     return s.replace(".", "p").replace("-", "n")
 
 
@@ -109,7 +111,7 @@ def _build_model(
     drop_probability: float = 0.4,
     drop_ratio_range: tuple[float, float] = (0.1, 0.9),
     batch_size: int = 5120,
-    learning_rate: float = 3e-4,
+    learning_rate: float = 1e-4,
     weight_decay: float = 1e-3,
     huber_delta: float = 1.0,
     max_epochs: int = 50,
@@ -269,8 +271,7 @@ class TestParquetWriter(pl.Callback):
 
         data_module = trainer.datamodule
 
-        meta_np = meta.detach().cpu().numpy()
-
+        meta_np = meta.detach().to(dtype=torch.float32).cpu().numpy()
         table = pa.table(
             {
                 "snapshot_id": (
@@ -291,12 +292,14 @@ class TestParquetWriter(pl.Callback):
                 ),
                 "prediction_scaled": (
                     predictions_scaled_np := predictions_scaled.detach()
+                    .to(dtype=torch.float32)
                     .cpu()
                     .numpy()
                     .reshape(-1)
                 ),
                 "target_scaled": (
                     targets_scaled_np := targets_scaled.detach()
+                    .to(dtype=torch.float32)
                     .cpu()
                     .numpy()
                     .reshape(-1)
@@ -477,7 +480,7 @@ class TestParquetWriter(pl.Callback):
     "--learning-rate",
     "learning_rate",
     type=float,
-    default=3e-4,
+    default=1e-4,
     show_default=True,
     help="Learning rate.",
 )
@@ -589,11 +592,17 @@ def train(
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         huber_delta=huber_delta,
-        max_epochs=max_epochs + warmup_epochs,
+        max_epochs=max_epochs,
         warmup_epochs=warmup_epochs,
         seed=seed,
     )
+    run_tag = (
+        f"{version_str}-{_fmt_value(subfolder)}-seed{seed}"
+        if subfolder
+        else f"{version_str}-seed{seed}"
+    )
     logger.info(f"Model Version: {version_str}")
+    logger.info(f"Run Tag: {run_tag}")
 
     output_dir = (
         (OUTPUT_BASE / "experiments" / subfolder / version_str)
@@ -615,7 +624,7 @@ def train(
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=num_devices,
         strategy="ddp" if num_devices > 1 else "auto",
-        max_epochs=max_epochs,
+        max_epochs=max_epochs + warmup_epochs,
         gradient_clip_val=0.5,
         log_every_n_steps=100,
         precision=_select_precision(),
@@ -631,7 +640,7 @@ def train(
                 mode="min",
                 save_top_k=1,
                 dirpath=str(output_dir),
-                filename=f"checkpoint-{version_str}-{{epoch:03d}}-{{val_huber_loss:.4e}}",
+                filename=f"ckpt-{run_tag}-{{epoch:03d}}-{{val_huber_loss:.4e}}",
             ),
             EarlyStopping(
                 monitor="val_huber_loss",
@@ -647,7 +656,7 @@ def train(
             TestParquetWriter(
                 output_file=(
                     test_parquet_file := (
-                        output_dir / f"{version_str}-test.parquet"
+                        output_dir / f"{run_tag}-test.parquet"
                     ).resolve()
                 ),
             ),
@@ -659,7 +668,7 @@ def train(
 
     # resume from checkpoint if available
     if ckpt_files := sorted(
-        output_dir.glob(f"checkpoint-{version_str}-*.ckpt"),
+        output_dir.glob(f"ckpt-{run_tag}-*.ckpt"),
         key=lambda p: p.stat().st_mtime,
     ):
         resume_ckpt = str(ckpt_files[-1])
