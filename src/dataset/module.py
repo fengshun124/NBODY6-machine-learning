@@ -9,7 +9,7 @@ from dataset.scaler import ArrayScalerBundle
 from dataset.shard import Shard
 from torch.utils.data import DataLoader, Dataset
 
-DataSample = tuple[
+NBODY6DataSample = tuple[
     torch.Tensor,  # features
     torch.Tensor,  # targets
     torch.Tensor,  # valid masks
@@ -329,7 +329,7 @@ class NBODY6DataModule(pl.LightningDataModule):
         batch: list[
             tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, int, int, int]
         ],
-    ) -> DataSample:
+    ) -> NBODY6DataSample:
         (
             features,
             targets,
@@ -372,6 +372,39 @@ class NBODY6DataModule(pl.LightningDataModule):
             collate_fn=self._collate_fn,
             generator=gen,
             **self.loader_params,
+        )
+
+    # move only tensors required for forward/loss to device;
+    # keep metadata on CPU.
+    def transfer_batch_to_device(
+        self,
+        batch: NBODY6DataSample,
+        device: torch.device,
+        dataloader_idx: int,
+    ) -> NBODY6DataSample:
+        try:
+            (
+                inputs,
+                targets,
+                mask,
+                meta,
+                snapshot_ids,
+                sample_ids,
+                source_counts,
+                sample_counts,
+            ) = batch
+        except Exception:
+            return super().transfer_batch_to_device(batch, device, dataloader_idx)
+
+        return (
+            inputs.to(device, non_blocking=True),
+            targets.to(device, non_blocking=True),
+            mask.to(device, non_blocking=True),
+            meta,
+            snapshot_ids,
+            sample_ids,
+            source_counts,
+            sample_counts,
         )
 
     def train_dataloader(self) -> DataLoader:

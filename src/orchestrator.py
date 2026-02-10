@@ -4,7 +4,7 @@ from typing import Any, Type
 import click
 import pytorch_lightning as pl
 import torch
-from dataset.module import DataSample
+from dataset.module import NBODY6DataSample
 from torch import nn
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset
@@ -60,9 +60,9 @@ class LightningRegressionOrchestrator(pl.LightningModule):
 
     def _evaluation(
         self,
-        batch: DataSample,
+        batch: NBODY6DataSample,
         stage: str,
-    ) -> DataSample:
+    ) -> NBODY6DataSample:
         (
             inputs,
             targets,
@@ -119,7 +119,7 @@ class LightningRegressionOrchestrator(pl.LightningModule):
     def validation_step(self, batch, batch_idx) -> None:
         self._evaluation(batch=batch, stage="val")
 
-    def test_step(self, batch, batch_idx) -> DataSample:
+    def test_step(self, batch, batch_idx) -> NBODY6DataSample:
         (
             _,
             predictions,
@@ -166,11 +166,8 @@ class LightningRegressionOrchestrator(pl.LightningModule):
                 return start_factor + (1.0 - start_factor) * progress
 
             cosine_epoch = max(0, min(epoch - warmup_epochs, cosine_t_max))
-            cosine_term = 0.5 * (
-                1.0 + math.cos(math.pi * cosine_epoch / cosine_t_max)
-            )
+            cosine_term = 0.5 * (1.0 + math.cos(math.pi * cosine_epoch / cosine_t_max))
             return eta_min_factor + (1.0 - eta_min_factor) * cosine_term
-
 
         scheduler = LambdaLR(optimizer=optimizer, lr_lambda=_warmup_cosine_lr_lambda)
 
@@ -234,7 +231,7 @@ class ToySetDataset(Dataset):
     def __len__(self) -> int:
         return self.num_samples
 
-    def __getitem__(self, idx: int) -> DataSample:
+    def __getitem__(self, idx: int) -> NBODY6DataSample:
         set_size = int(self.set_sizes[idx].item())
         valid_count = int(self.masks[idx].sum().item())
         return (
@@ -337,6 +334,7 @@ class ToySetDataModule(pl.LightningDataModule):
 
     def denormalize(self, y_norm: torch.Tensor) -> torch.Tensor:
         return y_norm * self.y_std + self.y_mean
+
 
 @click.command(
     help="Run a toy sanity-check training to verify the orchestrator wiring."
@@ -446,6 +444,7 @@ def _test_run():
     print("-" * 60)
     print(f"Mean Absolute Error: {mae:.4f}")
     print(" END OF TEST ".center(60, "="))
+
 
 if __name__ == "__main__":
     _test_run()

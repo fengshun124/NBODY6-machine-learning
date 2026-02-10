@@ -11,7 +11,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytorch_lightning as pl
 import torch
-from dataset.module import DataSample, NBODY6DataModule
+from dataset.module import NBODY6DataSample, NBODY6DataModule
 from model import DeepSetRegressor, SetTransformerRegressor, SummaryStatsRegressor
 from orchestrator import LightningRegressionOrchestrator
 from pytorch_lightning.callbacks import (
@@ -254,8 +254,8 @@ class TestParquetWriter(pl.Callback):
         self,
         trainer: pl.Trainer,
         pl_module: pl.LightningModule,
-        outputs: DataSample,
-        batch: DataSample,
+        outputs: NBODY6DataSample,
+        batch: NBODY6DataSample,
         batch_idx: int,
         dataloader_idx: int = 0,
     ) -> None:
