@@ -29,9 +29,9 @@ TARGET_PATTERNS = {
     "total_mass_within_2x_r_tidal": "total_mass",
 }
 
-# hard-coded param counts for each experiment configuration
+# hard-coded param sizes for each experiment configuration
 # based on the model architectures and feature dimensions
-MODEL_PARAM_COUNTS = {
+MODEL_PARAM_SIZES = {
     "SS[4]": {"sky": 125, "sky+L": 153, "cartesian": 181, "cartesian+L": 209},
     "SS[8]": {"sky": 249, "sky+L": 305, "cartesian": 361, "cartesian+L": 417},
     "SS[12]": {"sky": 373, "sky+L": 457, "cartesian": 541, "cartesian+L": 625},
@@ -77,12 +77,12 @@ def _parse_fmt_float(value: str) -> float:
     return float(value.translate(str.maketrans({"p": ".", "n": "-"})))
 
 
-def _lookup_model_param_count(model_label: str, feature_set_label: str) -> int:
+def _lookup_model_param_size(model_label: str, feature_set_label: str) -> int:
     try:
-        return MODEL_PARAM_COUNTS[model_label][feature_set_label]
+        return MODEL_PARAM_SIZES[model_label][feature_set_label]
     except KeyError as exc:
         raise ValueError(
-            "Missing model param count for "
+            "Missing model param size for "
             f"model={model_label!r}, feature_set={feature_set_label!r}"
         ) from exc
 
@@ -135,7 +135,7 @@ def _parse_experiment_name(experiment_name: str) -> dict[str, object]:
         case _:
             raise ValueError(f"Unknown model name: {model_name!r}")
 
-    model_param_count = _lookup_model_param_count(model_label, feature_set_label)
+    model_param_size = _lookup_model_param_size(model_label, feature_set_label)
 
     return {
         "experiment_name": parts["experiment_name"],
@@ -145,7 +145,7 @@ def _parse_experiment_name(experiment_name: str) -> dict[str, object]:
         "model_hparams": model_hparams,
         "model_family": model_family,
         "model_label": model_label,
-        "model_param_count": model_param_count,
+        "model_param_size": model_param_size,
         "n_star_per_sample": int(parts["n_star_per_sample"]),
         "n_sample_per_snapshot": int(parts["n_sample_per_snapshot"]),
         "drop_probability": _parse_fmt_float(parts["drop_probability"]),
@@ -171,17 +171,18 @@ def _calc_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
     }
 
 
-def _calc_sample_balanced_metrics(
+def _calc_samplewise_metrics(
     result_df: pd.DataFrame,
     y_true_col: str,
     y_pred_col: str,
     sample_id_col: str = "sample_id",
 ) -> dict[str, float]:
+    """Summarize per-sample error distributions with equal sample weighting."""
     required_columns = {sample_id_col, y_true_col, y_pred_col}
     missing_columns = required_columns - set(result_df.columns)
     if missing_columns:
         raise ValueError(
-            "Missing required columns for sample-balanced metrics: "
+            "Missing required columns for samplewise metrics: "
             f"{sorted(missing_columns)}"
         )
 
@@ -197,41 +198,41 @@ def _calc_sample_balanced_metrics(
         )
         .groupby(sample_id_col, sort=False)
         .agg(
-            sample_mae=("abs_error", "median"),
+            sample_medae=("abs_error", "median"),
             sample_mse=("sq_error", "mean"),
             sample_bias=("error", "median"),
         )
     )
     per_sample_df["sample_rmse"] = np.sqrt(per_sample_df["sample_mse"])
 
-    sample_mae = per_sample_df["sample_mae"].to_numpy()
+    sample_medae = per_sample_df["sample_medae"].to_numpy()
     sample_rmse = per_sample_df["sample_rmse"].to_numpy()
     sample_bias = per_sample_df["sample_bias"].to_numpy()
 
-    mae_q25, mae_q50, mae_q75 = np.quantile(sample_mae, [0.25, 0.50, 0.75])
-    mae_iqr = mae_q75 - mae_q25
-    mae_inlier = sample_mae[
-        (sample_mae >= mae_q25 - 1.5 * mae_iqr)
-        & (sample_mae <= mae_q75 + 1.5 * mae_iqr)
+    medae_q25, medae_q50, medae_q75 = np.quantile(sample_medae, [0.25, 0.50, 0.75])
+    medae_iqr = medae_q75 - medae_q25
+    medae_inlier = sample_medae[
+        (sample_medae >= medae_q25 - 1.5 * medae_iqr)
+        & (sample_medae <= medae_q75 + 1.5 * medae_iqr)
     ]
-    mae_whisker_low, mae_whisker_high = (
-        (float(np.min(mae_inlier)), float(np.max(mae_inlier)))
-        if mae_inlier.size > 0
-        else (mae_q25, mae_q75)
+    medae_whisker_low, medae_whisker_high = (
+        (float(np.min(medae_inlier)), float(np.max(medae_inlier)))
+        if medae_inlier.size > 0
+        else (medae_q25, medae_q75)
     )
 
     return {
-        "balanced_mae": float(mae_q50),
-        "balanced_rmse": float(np.median(sample_rmse)),
-        "balanced_bias": float(np.median(sample_bias)),
-        "balanced_mae_p90": float(np.quantile(sample_mae, 0.90)),
-        "balanced_mae_p95": float(np.quantile(sample_mae, 0.95)),
-        "balanced_mae_q25": float(mae_q25),
-        "balanced_mae_q50": float(mae_q50),
-        "balanced_mae_q75": float(mae_q75),
-        "balanced_mae_iqr": float(mae_iqr),
-        "balanced_mae_whisker_low": float(mae_whisker_low),
-        "balanced_mae_whisker_high": float(mae_whisker_high),
+        "samplewise_medae": float(medae_q50),
+        "samplewise_rmse": float(np.median(sample_rmse)),
+        "samplewise_bias": float(np.median(sample_bias)),
+        "samplewise_medae_p90": float(np.quantile(sample_medae, 0.90)),
+        "samplewise_medae_p95": float(np.quantile(sample_medae, 0.95)),
+        "samplewise_medae_q25": float(medae_q25),
+        "samplewise_medae_q50": float(medae_q50),
+        "samplewise_medae_q75": float(medae_q75),
+        "samplewise_medae_iqr": float(medae_iqr),
+        "samplewise_medae_whisker_low": float(medae_whisker_low),
+        "samplewise_medae_whisker_high": float(medae_whisker_high),
         "n_sample_id": int(len(per_sample_df)),
     }
 
@@ -439,7 +440,7 @@ def _process_parquet_file(
         test_result_df["target_original"].values,
         test_result_df["prediction_original"].values,
     )
-    original_balanced_metrics = _calc_sample_balanced_metrics(
+    original_sample_metrics = _calc_samplewise_metrics(
         test_result_df,
         y_true_col="target_original",
         y_pred_col="prediction_original",
@@ -448,7 +449,7 @@ def _process_parquet_file(
         test_result_df["target_scaled"].values,
         test_result_df["prediction_scaled"].values,
     )
-    scaled_balanced_metrics = _calc_sample_balanced_metrics(
+    scaled_sample_metrics = _calc_samplewise_metrics(
         test_result_df,
         y_true_col="target_scaled",
         y_pred_col="prediction_scaled",
@@ -469,11 +470,11 @@ def _process_parquet_file(
     return {
         **experiment_info,
         **original_metrics,
-        **original_balanced_metrics,
+        **original_sample_metrics,
         **{f"scaled_{k}": v for k, v in scaled_metrics.items()},
         **{
             f"scaled_{k}": v
-            for k, v in scaled_balanced_metrics.items()
+            for k, v in scaled_sample_metrics.items()
             if k != "n_sample_id"
         },
     }
