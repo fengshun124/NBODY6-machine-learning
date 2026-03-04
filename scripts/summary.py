@@ -171,7 +171,7 @@ def _calc_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
     }
 
 
-def _calc_samplewise_metrics(
+def _calc_sample_balanced_metrics(
     result_df: pd.DataFrame,
     y_true_col: str,
     y_pred_col: str,
@@ -222,17 +222,16 @@ def _calc_samplewise_metrics(
     )
 
     return {
-        "samplewise_medae": float(medae_q50),
-        "samplewise_rmse": float(np.median(sample_rmse)),
-        "samplewise_bias": float(np.median(sample_bias)),
-        "samplewise_medae_p90": float(np.quantile(sample_medae, 0.90)),
-        "samplewise_medae_p95": float(np.quantile(sample_medae, 0.95)),
-        "samplewise_medae_q25": float(medae_q25),
-        "samplewise_medae_q50": float(medae_q50),
-        "samplewise_medae_q75": float(medae_q75),
-        "samplewise_medae_iqr": float(medae_iqr),
-        "samplewise_medae_whisker_low": float(medae_whisker_low),
-        "samplewise_medae_whisker_high": float(medae_whisker_high),
+        "sb_medae_med": float(medae_q50),
+        "sb_rmse_med": float(np.median(sample_rmse)),
+        "sb_bias_med": float(np.median(sample_bias)),
+        "sb_medae_p90": float(np.quantile(sample_medae, 0.90)),
+        "sb_medae_p95": float(np.quantile(sample_medae, 0.95)),
+        "sb_medae_q25": float(medae_q25),
+        "sb_medae_q75": float(medae_q75),
+        "sb_medae_iqr": float(medae_iqr),
+        "sb_medae_wlow": float(medae_whisker_low),
+        "sb_medae_whigh": float(medae_whisker_high),
         "n_sample_id": int(len(per_sample_df)),
     }
 
@@ -436,20 +435,22 @@ def _process_parquet_file(
         return None
 
     test_result_df = pd.read_parquet(parquet_file)
+    # raw metrics
     original_metrics = _calc_metrics(
         test_result_df["target_original"].values,
         test_result_df["prediction_original"].values,
-    )
-    original_sample_metrics = _calc_samplewise_metrics(
-        test_result_df,
-        y_true_col="target_original",
-        y_pred_col="prediction_original",
     )
     scaled_metrics = _calc_metrics(
         test_result_df["target_scaled"].values,
         test_result_df["prediction_scaled"].values,
     )
-    scaled_sample_metrics = _calc_samplewise_metrics(
+    # sample-balanced metrics
+    original_sample_metrics = _calc_sample_balanced_metrics(
+        test_result_df,
+        y_true_col="target_original",
+        y_pred_col="prediction_original",
+    )
+    scaled_sample_metrics = _calc_sample_balanced_metrics(
         test_result_df,
         y_true_col="target_scaled",
         y_pred_col="prediction_scaled",
@@ -469,8 +470,13 @@ def _process_parquet_file(
 
     return {
         **experiment_info,
-        **original_metrics,
-        **original_sample_metrics,
+        "n_sample_id": original_sample_metrics["n_sample_id"],
+        **{f"physical_{k}": v for k, v in original_metrics.items()},
+        **{
+            f"physical_{k}": v
+            for k, v in original_sample_metrics.items()
+            if k != "n_sample_id"
+        },
         **{f"scaled_{k}": v for k, v in scaled_metrics.items()},
         **{
             f"scaled_{k}": v
@@ -478,6 +484,48 @@ def _process_parquet_file(
             if k != "n_sample_id"
         },
     }
+
+
+def _calc_pctl_robust_floor_metric(
+    summary_df: pd.DataFrame,
+    alpha: float = 0.5,
+    beta: float = 0.5,
+) -> pd.DataFrame:
+    # compute scores and aggregate separately
+    condition_groups = summary_df.groupby(
+        ["feature_set_label", "target_label"], sort=False
+    )
+    condition_count = condition_groups["physical_sb_medae_med"].transform("count")
+    rank_span = (condition_count - 1).clip(lower=1)
+
+    # rank-normalised score for median MedAE
+    rank_medae_med = condition_groups["physical_sb_medae_med"].rank(
+        ascending=True, method="average"
+    )
+    score_medae_med = 1.0 - (rank_medae_med - 1.0) / rank_span
+
+    # rank-normalised score for 95th-percentile MedAE
+    rank_medae_p95 = condition_groups["physical_sb_medae_p95"].rank(
+        ascending=True, method="average"
+    )
+    score_medae_p95 = 1.0 - (rank_medae_p95 - 1.0) / rank_span
+
+    condition_score = alpha * score_medae_med + (1.0 - alpha) * score_medae_p95
+    model_scores = (
+        pd.DataFrame(
+            {
+                "model_label": summary_df["model_label"],
+                "condition_score": condition_score,
+            }
+        )
+        .groupby("model_label")["condition_score"]
+        .agg(score_mean="mean", score_floor="min", score_std="std")
+    )
+    model_scores["pctl_robust_floor"] = (
+        beta * model_scores["score_mean"] + (1.0 - beta) * model_scores["score_floor"]
+    )
+
+    return model_scores.sort_values("pctl_robust_floor", ascending=False).reset_index()
 
 
 @click.command()
@@ -522,6 +570,7 @@ def main(
     if not parquet_files:
         raise FileNotFoundError(f"No parquet files found under: {result_root}")
 
+    # gather summary records
     summary_records = [
         r
         for r in tqdm(
@@ -533,7 +582,6 @@ def main(
         )
         if r is not None
     ]
-    # gather summary records
     summary_df = (
         pd.DataFrame(summary_records)
         .sort_values(
@@ -546,12 +594,18 @@ def main(
         )
         .reset_index(drop=True)
     )
-
     summary_csv_path = exp_dir / "summary.csv"
     summary_df.to_csv(summary_csv_path, index=False)
 
     click.echo(f"Saved summary CSV: {summary_csv_path}")
     click.echo(f"Saved figure directory: {fig_export_dir}")
+
+    # calculate percentile robust floor metric
+    prf_metric = _calc_pctl_robust_floor_metric(summary_df)
+    prf_csv_path = exp_dir / "pctl_robust_floor_scores.csv"
+    prf_metric.to_csv(prf_csv_path, index=False)
+
+    click.echo(f"Saved percentile robust floor metric CSV: {prf_csv_path}")
 
 
 if __name__ == "__main__":
