@@ -304,10 +304,10 @@ class TestParquetWriter(pl.Callback):
                     .numpy()
                     .reshape(-1)
                 ),
-                "prediction_original": data_module.inverse_transform_targets(
+                "prediction_physical": data_module.inverse_transform_targets(
                     predictions_scaled_np.reshape(-1, 1)
                 ).reshape(-1),
-                "target_original": data_module.inverse_transform_targets(
+                "target_physical": data_module.inverse_transform_targets(
                     targets_scaled_np.reshape(-1, 1)
                 ).reshape(-1),
                 # meta columns
