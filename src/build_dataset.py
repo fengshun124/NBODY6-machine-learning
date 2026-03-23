@@ -107,11 +107,11 @@ def _cache_per_run_shard(
         joblib_path = JOBLIB_ROOT / f"{run_id}-obs.joblib"
         if not joblib_path.exists():
             raise FileNotFoundError(f"Joblib file not found: {joblib_path}")
-        raw_joblib_file = joblib.load(joblib_path)
+        joblib_file = joblib.load(joblib_path)
         feature_keys_list = list(feature_keys)
         target_keys_list = list(target_keys)
         snapshot_arr = []
-        for coord, series in raw_joblib_file.items():
+        for coord, series in joblib_file.items():
             for _timestamp, snapshot in series.items():
                 df = pd.DataFrame(snapshot["stars"])
                 if len(df) < min_stars:
