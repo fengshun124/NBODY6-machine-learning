@@ -574,6 +574,7 @@ def train(
         drop_ratio_range=drop_ratio_range,
         feature_keys=feature_keys,
         target_key=target_key,
+        seed=seed,
     )
     data_module.setup()
 

@@ -1,10 +1,10 @@
 # Machine Learning Framework for Star Cluster Properties Prediction
 
-This repository contains a PyTorch Lightning framework that predicts star cluster properties from variable-size sets of member stars. It implements three permutation-invariant architectures for set-based regression.
+This module turns pseudo-observed cluster snapshots into training datasets and PyTorch Lightning experiments for star cluster property prediction. It implements three permutation-invariant architectures for set-based regression.
 
 ## Requirements
 
-Use Python 3.12+ with the packages below. Pinned versions are listed in [`requirements.txt`](./requirements.txt).
+Use Python 3.12+ for this module. Pinned versions are listed in [`requirements.txt`](./requirements.txt).
 
 - `click`
 - `joblib`
@@ -47,7 +47,9 @@ watch -n 1 -c gpustat --color
 
 ### Configure Environment
 
-Create a `.env` file from [`.env.template`](.env.template), then set at least these variables.
+Run the commands below from the `machine-learning/` directory.
+
+Create a `.env` file from [`.env.template`](.env.template), then set at least:
 
 - `OUTPUT_BASE`: destination for pipeline, dataset, and training outputs
 - `JOBLIB_ROOT`: joblib cache root used by the NBODY6 data pipeline
@@ -59,15 +61,16 @@ cp .env.template .env
 
 ### Prepare Dataset
 
-Build the cached, scaled dataset from NBODY6 pipeline joblib caches. Run this from the `machine-learning` directory.
+Build the cached, scaled dataset from NBODY6 pipeline joblib caches.
 
 ```bash
+cd ./machine-learning
 python ./src/build_dataset.py \
   --split-mft-json /path/to/split/manifest.json \
   --dataset-export-path dataset  # optional (default: OUTPUT_BASE/dataset)
 ```
 
-Outputs under the dataset export path include:
+The dataset export path will contain:
 
 - `raw-<split>-shard.npz` — merged per-split raw shards for train, validation, and test
 - `scaled-<split>-shard.npz` — scaled shards used for training and evaluation
@@ -76,7 +79,7 @@ Outputs under the dataset export path include:
 
 #### Notes
 
-- The script requires a split manifest through `--split-mft-json`. See [dataset_split.ipynb](https://github.com/fengshun124/NBODY6-data-pipeline/blob/main/notebooks/dataset_split.ipynb) for generation steps. Joblib caches are loaded from the path in `JOBLIB_ROOT` from `.env`. For background, see the [NBODY6-data-pipeline README](https://github.com/fengshun124/NBODY6-data-pipeline/blob/main/README.md).
+- The script requires a split manifest through `--split-mft-json`. See [`dataset_split.ipynb`](../data-pipeline/notebooks/dataset_split.ipynb) for generation steps. Joblib caches are loaded from the path in `JOBLIB_ROOT` from `.env`. For background, see the [data-pipeline README](../data-pipeline/README.md).
 - The default feature/target keys and scaler config are defined in the `main` function of `src/build_dataset.py`. Update them there for different fields.
 
 ### Train a Model
@@ -84,6 +87,7 @@ Outputs under the dataset export path include:
 After building the dataset, invoke the training entrypoint from `machine-learning`.
 
 ```bash
+cd ./machine-learning
 # Example: use one GPU
 CUDA_VISIBLE_DEVICES=0 python ./src/train.py \
   --dataset /path/to/dataset/ \
@@ -106,7 +110,7 @@ CUDA_VISIBLE_DEVICES=0 python ./src/train.py \
   -wd 3e-3
 ```
 
-Run with `--help` to see all available options.
+Use `--help` to see the full option set.
 
 ```bash
 python ./src/train.py --help
@@ -147,7 +151,7 @@ Default parameters for each model family are as follows. Update them with `--hpa
 
 See [`src/train.py`](./src/train.py) for full details on all options.
 
-### _Quick Checklist_
+## Quick Start
 
 - Create and edit `.env` from `.env.template`.
 - Ensure `JOBLIB_ROOT` points to NBODY6 joblib caches.
@@ -163,20 +167,21 @@ The framework provides three permutation-invariant architectures for variable-si
 
 ```mermaid
 flowchart TB
-    A["Input set<br/>$\mathbf{X}\in\mathbb{R}^{n\times d_{\mathrm{in}}}$, mask applied"] --> B["Per-feature summary statistics<br/>$\{\mathrm{mean},\mathrm{median},\mathrm{std},q_{0.25},q_{0.75},\mathrm{min},\mathrm{max}\}$"]
-    B --> C["Concatenate<br/>$\mathbf{s}=[n_{\mathrm{valid}},\mathrm{stats}(\mathbf{X},\mathbf{m})]\in\mathbb{R}^{1+7d_{\mathrm{in}}}$"]
-    C --> D["Regression head (MLP)<br/>$\hat{y}=g_{\theta}(\mathbf{s})\in\mathbb{R}$"]
-    D --> E["Output<br/>$\hat{y}$"]
+    A["**Input**<br/>$\mathbf{X}\in\mathbb{R}^{n\times d_{\mathrm{in}}}$<br/><i>validity mask applied</i>"] --> B["**Feature Extraction**<br/>Masked feature-wise statistics<br/>$\{\boldsymbol{\mu},\mathbf{q}_{0.50},\mathbf{x}_{\min},\mathbf{x}_{\max},\boldsymbol{\sigma},\mathbf{q}_{0.25},\mathbf{q}_{0.75}\}$"]
+    B --> C["**Set Representation**<br/>Concatenate count and statistics<br/>$\mathbf{z}=[n_{\mathrm{valid}},\boldsymbol{\mu},\mathbf{q}_{0.50},\mathbf{x}_{\min},\mathbf{x}_{\max},\boldsymbol{\sigma},\mathbf{q}_{0.25},\mathbf{q}_{0.75}]$<br/>$\mathbf{z}\in\mathbb{R}^{1+7d_{\mathrm{in}}}$"]
+    C --> D["**Prediction Head**<br/>Fully-connected decoder (MLP)<br/>$\hat{y}=g_{\theta}(\mathbf{z})\in\mathbb{R}$"]
+    D --> E["**Output**<br/>$\hat{y}$"]
 
-    classDef input fill:#f9d6d5,stroke:#333,stroke-width:2px,color:#111;
-    classDef process fill:#e7e7e7,stroke:#333,stroke-width:2px,color:#111;
-    classDef intrinsic fill:#fde6bd,stroke:#333,stroke-width:2px,color:#111;
-    classDef output fill:#ccefd9,stroke:#333,stroke-width:2px,color:#111;
+    classDef input fill:#fde2e2,stroke:#333,stroke-width:1.5px,color:#111,rx:8,ry:8;
+    classDef feature fill:#fde6bd,stroke:#333,stroke-width:1.5px,color:#111,rx:8,ry:8;
+    classDef aggregate fill:#d9f0f7,stroke:#333,stroke-width:1.5px,color:#111,rx:8,ry:8;
+    classDef head fill:#dbeafe,stroke:#333,stroke-width:1.5px,color:#111,rx:8,ry:8;
+    classDef output fill:#d9f2e3,stroke:#333,stroke-width:1.5px,color:#111,rx:8,ry:8;
 
     class A input;
-    class B process;
-    class C intrinsic;
-    class D process;
+    class B feature;
+    class C aggregate;
+    class D head;
     class E output;
 ```
 
@@ -184,20 +189,21 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    A["Input set<br/>$\mathbf{X}\in\mathbb{R}^{n\times d_{\mathrm{in}}}$, mask applied"] --> B["Element-wise encoder $\phi_{\theta}$ (MLP)<br/>$\mathbf{H}=\phi_{\theta}(\mathbf{X})\in\mathbb{R}^{n\times e}$"]
-    B --> C["Permutation-invariant pooling<br/>$\mathbf{z}=\mathrm{mean}(\mathbf{H};\mathbf{m})$ or $\sum(\mathbf{H};\mathbf{m})$"]
-    C --> D["Set decoder $\rho_{\theta}$ (MLP)<br/>$\hat{y}=\rho_{\theta}(\mathbf{z})\in\mathbb{R}$"]
-    D --> E["Output<br/>$\hat{y}$"]
+    A["**Input**<br/>$\mathbf{X}\in\mathbb{R}^{n\times d_{\mathrm{in}}}$<br/><i>validity mask applied</i>"] --> B["**Feature Extraction**<br/>Element-wise encoder $\phi_{\theta}$ (MLP)<br/>$\mathbf{H}=\phi_{\theta}(\mathbf{X})\odot\mathbf{m}\in\mathbb{R}^{n\times e}$"]
+    B --> C["**Aggregation**<br/>Permutation-invariant pooling<br/>$\mathbf{z}=\mathrm{mean}(\mathbf{H};\mathbf{m})$ or $\sum(\mathbf{H};\mathbf{m})$<br/>$\mathbf{z}\in\mathbb{R}^{e}$"]
+    C --> D["**Prediction Head**<br/>Fully-connected decoder $\rho_{\theta}$ (MLP)<br/>$\hat{y}=\rho_{\theta}(\mathbf{z})\in\mathbb{R}$"]
+    D --> E["**Output**<br/>$\hat{y}$"]
 
-    classDef input fill:#f9d6d5,stroke:#333,stroke-width:2px,color:#111;
-    classDef process fill:#e7e7e7,stroke:#333,stroke-width:2px,color:#111;
-    classDef intrinsic fill:#fde6bd,stroke:#333,stroke-width:2px,color:#111;
-    classDef output fill:#ccefd9,stroke:#333,stroke-width:2px,color:#111;
+    classDef input fill:#fde2e2,stroke:#333,stroke-width:1.5px,color:#111,rx:8,ry:8;
+    classDef feature fill:#fde6bd,stroke:#333,stroke-width:1.5px,color:#111,rx:8,ry:8;
+    classDef aggregate fill:#d9f0f7,stroke:#333,stroke-width:1.5px,color:#111,rx:8,ry:8;
+    classDef head fill:#dbeafe,stroke:#333,stroke-width:1.5px,color:#111,rx:8,ry:8;
+    classDef output fill:#d9f2e3,stroke:#333,stroke-width:1.5px,color:#111,rx:8,ry:8;
 
     class A input;
-    class B process;
-    class C intrinsic;
-    class D process;
+    class B feature;
+    class C aggregate;
+    class D head;
     class E output;
 ```
 
@@ -205,21 +211,22 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    A["Input set<br/>$\mathbf{X}\in\mathbb{R}^{n\times d_{\mathrm{in}}}$, mask applied"] --> B["Set encoder (SAB stack, $L_{\mathrm{SAB}}$ blocks)<br/>$\mathbf{H}^{(L_{\mathrm{SAB}})}\in\mathbb{R}^{n\times w_{\mathrm{ST}}}$"]
-    B --> C["PMA pooling (1 seed)<br/>$\mathbf{Z}=\mathrm{PMA}(\mathbf{H}^{(L_{\mathrm{SAB}})},\mathbf{m})\in\mathbb{R}^{1\times w_{\mathrm{ST}}}$"]
-    C --> D["Squeeze<br/>$\mathbf{z}\in\mathbb{R}^{w_{\mathrm{ST}}}$"]
-    D --> E["Decoder (MLP)<br/>$\hat{y}=\mathrm{decoder}(\mathbf{z})\in\mathbb{R}$"]
-    E --> F["Output<br/>$\hat{y}$"]
+    A["**Input**<br/>$\mathbf{X}\in\mathbb{R}^{n\times d_{\mathrm{in}}}$<br/><i>validity mask applied</i>"] --> B["**Feature Extraction**<br/>SAB encoder stack ($L_{\mathrm{SAB}}$ block(s))<br/>$\mathbf{H}^{(L_{\mathrm{SAB}})}\in\mathbb{R}^{n\times w_{\mathrm{ST}}}$"]
+    B --> C["**Aggregation**<br/>Pooling multihead attention (PMA, 1 seed)<br/>$\mathbf{Z}=\mathrm{PMA}(\mathbf{H}^{(L_{\mathrm{SAB}})};\mathbf{m})\in\mathbb{R}^{1\times w_{\mathrm{ST}}}$"]
+    C --> D["**Set Representation**<br/>Squeeze pooled seed output<br/>$\mathbf{z}\in\mathbb{R}^{w_{\mathrm{ST}}}$"]
+    D --> E["**Prediction Head**<br/>Decoder MLP<br/>$\hat{y}=\mathrm{decoder}(\mathbf{z})\in\mathbb{R}$"]
+    E --> F["**Output**<br/>$\hat{y}$"]
 
-    classDef input fill:#f9d6d5,stroke:#333,stroke-width:2px,color:#111;
-    classDef process fill:#e7e7e7,stroke:#333,stroke-width:2px,color:#111;
-    classDef intrinsic fill:#fde6bd,stroke:#333,stroke-width:2px,color:#111;
-    classDef output fill:#ccefd9,stroke:#333,stroke-width:2px,color:#111;
+    classDef input fill:#fde2e2,stroke:#333,stroke-width:1.5px,color:#111,rx:8,ry:8;
+    classDef feature fill:#fde6bd,stroke:#333,stroke-width:1.5px,color:#111,rx:8,ry:8;
+    classDef aggregate fill:#d9f0f7,stroke:#333,stroke-width:1.5px,color:#111,rx:8,ry:8;
+    classDef head fill:#dbeafe,stroke:#333,stroke-width:1.5px,color:#111,rx:8,ry:8;
+    classDef output fill:#d9f2e3,stroke:#333,stroke-width:1.5px,color:#111,rx:8,ry:8;
 
     class A input;
-    class B process;
-    class C intrinsic;
-    class D intrinsic;
-    class E process;
+    class B feature;
+    class C aggregate;
+    class D aggregate;
+    class E head;
     class F output;
 ```
